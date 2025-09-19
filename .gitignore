@@ -1,0 +1,51 @@
+# Miscellaneous
+*.class
+*.lock
+*.log
+*.pyc
+*.swp
+.DS_Store
+.atom/
+.buildlog/
+.history
+.svn/
+
+# Packages - https://dart.dev/guides/libraries/private-files
+# These files are created by the Dart pub tool.
+.dart_tool/
+.packages
+pubspec.lock
+
+# Flutter - https://flutter.dev/docs/deployment/android#reviewing-the-build-configuration
+build/
+.flutter-plugins
+.flutter-plugins-dependencies
+
+# IDEs
+.idea/
+.vscode/
+*.iml
+
+# Android Studio
+.gradle
+local.properties
+
+# Xcode
+#
+# Flutter iOS builds auto-generate schemes in an Xcode project.
+# These schemes are stored in a user-specific location, not in the direct
+# project sub-folder. To avoid repeatedly checking in schemes, they should
+# be ignored.
+/ios/Flutter/ephemeral/
+/ios/Flutter/App.framework
+/ios/Flutter/Flutter.framework
+/ios/Flutter/Generated.xcconfig
+/ios/Flutter/flutter_export_environment.sh
+/ios/.symlinks/
+/ios/Pods/
+
+# macOS
+/macos/Flutter/ephemeral/
+
+# Windows
+/windows/flutter/ephemeral/
