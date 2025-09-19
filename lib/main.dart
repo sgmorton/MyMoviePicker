@@ -464,6 +464,34 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
     return false;
   }
 
+  Future<List<String>> _fetchImageChoicesFromTmdb(
+    String title,
+    String? year,
+  ) async {
+    if (_tmdbApiKey == null || _tmdbApiKey!.isEmpty) return [];
+
+    final titleEncoded = Uri.encodeQueryComponent(title);
+    final yearParam = year != null ? '&year=${Uri.encodeComponent(year)}' : '';
+    final url =
+        'https://api.themoviedb.org/3/search/movie?query=$titleEncoded$yearParam&api_key=$_tmdbApiKey';
+
+    try {
+      final response = await http
+          .get(Uri.parse(url))
+          .timeout(const Duration(seconds: 10));
+      if (response.statusCode == 200) {
+        final results = json.decode(response.body)['results'] as List;
+        return results
+            .where((r) => r['poster_path'] != null)
+            .map((r) => 'https://image.tmdb.org/t/p/w342${r['poster_path']}')
+            .toList();
+      }
+    } catch (e) {
+      print('Error fetching choices from TMDB for $title: $e');
+    }
+    return [];
+  }
+
   void _attachImagesToEntries() {
     bool changed = false;
     for (final m in _all) {
@@ -812,6 +840,18 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
       print(
         'Background image fetch complete. Found $successCount of $total images.',
       );
+
+      // AFTER automatic search, check for failures and start manual search
+      final failures = _all.where((e) => e.imageUrl.isEmpty).toList();
+      if (failures.isNotEmpty && mounted) {
+        _startManualFuzzySearch(failures);
+      } else if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Image fetch complete. All images found!'),
+          ),
+        );
+      }
     } finally {
       setState(() {
         _isFetchingImages = false;
@@ -819,6 +859,55 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
       ScaffoldMessenger.of(
         context,
       ).showSnackBar(const SnackBar(content: Text('Image fetch complete.')));
+    }
+  }
+
+  Future<void> _startManualFuzzySearch(List<MovieEntry> failures) async {
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Manual Search'),
+        content: Text(
+          '${failures.length} movies could not be found automatically. Would you like to search for them manually?',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('No'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Yes, Start Search'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirm == true) {
+      for (final movie in failures) {
+        if (!mounted) break;
+        final result = await showDialog<String?>(
+          context: context,
+          barrierDismissible: false,
+          builder: (context) => _FuzzySearchDialog(
+            entry: movie,
+            onSearch: _fetchImageChoicesFromTmdb,
+          ),
+        );
+
+        if (result != null && result != 'skip') {
+          setState(() {
+            movie.imageUrl = result;
+          });
+          await _persistEntries();
+          _applyFilters();
+        }
+      }
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Manual search complete!')),
+        );
+      }
     }
   }
 
@@ -2012,6 +2101,190 @@ class _SurpriseDialog extends StatelessWidget {
           ),
         ),
       ),
+    );
+  }
+}
+
+List<String> _getFuzzyTitles(String originalTitle) {
+  final titles = <String>{}; // Use a Set to avoid duplicates
+  titles.add(originalTitle);
+
+  // Remove content in parentheses (e.g., year, edition)
+  titles.add(originalTitle.replaceAll(RegExp(r'\s*\([^)]*\)'), '').trim());
+
+  // Remove content after a colon (e.g., subtitle)
+  titles.add(originalTitle.split(':').first.trim());
+
+  // Combination: remove subtitle, then parentheses
+  final noSubtitle = originalTitle.split(':').first.trim();
+  titles.add(noSubtitle.replaceAll(RegExp(r'\s*\([^)]*\)'), '').trim());
+
+  return titles.where((t) => t.isNotEmpty).toList();
+}
+
+class _FuzzySearchDialog extends StatefulWidget {
+  final MovieEntry entry;
+  final Future<List<String>> Function(String title, String? year) onSearch;
+
+  const _FuzzySearchDialog({required this.entry, required this.onSearch});
+
+  @override
+  State<_FuzzySearchDialog> createState() => _FuzzySearchDialogState();
+}
+
+class _FuzzySearchDialogState extends State<_FuzzySearchDialog> {
+  late final List<String> _searchTerms;
+  int _currentSearchTermIndex = 0;
+  late final TextEditingController _textController;
+
+  List<String> _imageChoices = [];
+  String? _selectedImageUrl;
+  bool _isLoading = true;
+  bool _noMoreTerms = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _searchTerms = _getFuzzyTitles(widget.entry.title);
+    _textController = TextEditingController(
+      text: _searchTerms[_currentSearchTermIndex],
+    );
+    _fetchChoices();
+  }
+
+  @override
+  void dispose() {
+    _textController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _fetchChoices({String? customSearchTerm}) async {
+    setState(() {
+      _isLoading = true;
+      _imageChoices = [];
+      _selectedImageUrl = null;
+    });
+
+    final searchTerm =
+        customSearchTerm ?? _searchTerms[_currentSearchTermIndex];
+    if (customSearchTerm == null) {
+      _textController.text = searchTerm;
+    }
+    final results = await widget.onSearch(searchTerm, widget.entry.year);
+
+    if (mounted) {
+      setState(() {
+        _imageChoices = results;
+        _isLoading = false;
+        _noMoreTerms = _currentSearchTermIndex >= _searchTerms.length - 1;
+      });
+    }
+  }
+
+  void _nextSearchTerm() {
+    if (!_noMoreTerms) {
+      _currentSearchTermIndex++;
+      _textController.text = _searchTerms[_currentSearchTermIndex];
+      _fetchChoices();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: Text('Manual Search: ${widget.entry.title}'),
+      content: SizedBox(
+        width: 800,
+        height: 500,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _textController,
+                    decoration: const InputDecoration(
+                      labelText: 'Search Term',
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                IconButton(
+                  icon: const Icon(Icons.search),
+                  onPressed: () =>
+                      _fetchChoices(customSearchTerm: _textController.text),
+                ),
+              ],
+            ),
+            const SizedBox(height: 16),
+            Expanded(
+              child: _isLoading
+                  ? const Center(child: CircularProgressIndicator())
+                  : _imageChoices.isEmpty
+                  ? const Center(child: Text('No results found.'))
+                  : GridView.builder(
+                      gridDelegate:
+                          const SliverGridDelegateWithMaxCrossAxisExtent(
+                            maxCrossAxisExtent: 150,
+                            mainAxisSpacing: 8,
+                            crossAxisSpacing: 8,
+                            childAspectRatio: 2 / 3,
+                          ),
+                      itemCount: _imageChoices.length,
+                      itemBuilder: (context, index) {
+                        final url = _imageChoices[index];
+                        final isSelected = url == _selectedImageUrl;
+                        return InkWell(
+                          onTap: () {
+                            setState(() {
+                              _selectedImageUrl = url;
+                            });
+                          },
+                          child: GridTile(
+                            child: Container(
+                              decoration: BoxDecoration(
+                                border: Border.all(
+                                  color: isSelected
+                                      ? Theme.of(context).colorScheme.primary
+                                      : Colors.transparent,
+                                  width: 4,
+                                ),
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                              child: ClipRRect(
+                                borderRadius: BorderRadius.circular(4),
+                                child: _Poster(
+                                  imageUrl: url,
+                                  title: widget.entry.title,
+                                ),
+                              ),
+                            ),
+                          ),
+                        );
+                      },
+                    ),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context, 'skip'),
+          child: const Text('Skip Movie'),
+        ),
+        FilledButton(
+          onPressed: _noMoreTerms ? null : _nextSearchTerm,
+          child: const Text('Next Variation'),
+        ),
+        FilledButton(
+          onPressed: _selectedImageUrl != null
+              ? () => Navigator.pop(context, _selectedImageUrl)
+              : null,
+          child: const Text('Accept'),
+        ),
+      ],
     );
   }
 }
