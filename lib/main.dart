@@ -187,15 +187,22 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
   void initState() {
     super.initState();
     _box = Hive.box('movie_picker');
+    _initialize();
+  }
 
+  void _initialize() async {
     // Check for data version and clear old data if necessary
     final storedVersion = _box.get('data_version') as int? ?? 0;
     if (storedVersion < _kDataVersion) {
       print(
         'Old data version ($storedVersion) found. Clearing cache to force re-parse from version $_kDataVersion.',
       );
-      _box.delete('entries');
-      _box.delete('image_files');
+      await _box.delete('entries');
+      await _box.delete('image_files');
+      await _box.put(
+        'data_version',
+        _kDataVersion,
+      ); // Update version immediately
     }
 
     _tmdbApiKey = _box.get('tmdb_api_key') as String?;
@@ -703,7 +710,6 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
     print('Saving ${data.length} items, ${withImages} with images');
 
     await _box.put('entries', data);
-    await _box.put('data_version', _kDataVersion); // Update data version
   }
 
   void _restoreFromStorage() {
