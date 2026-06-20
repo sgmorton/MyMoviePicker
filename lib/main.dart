@@ -3,9 +3,10 @@ import 'dart:math';
 
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:xml/xml.dart';
-// ignore: avoid_web_libraries_in_flutter
-import 'dart:html' as html;
+import 'src/html/html_stub.dart' if (dart.library.html) 'dart:html' as html;
+import 'package:file_picker/file_picker.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 
 Future<void> main() async {
@@ -266,14 +267,49 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
   }
 
   void _pickFile() async {
-    final input = html.FileUploadInputElement()
-      ..accept = '.xml,image/*'
-      ..multiple = true;
-    input.click();
-    input.onChange.first.then((_) async {
-      if (input.files == null || input.files!.isEmpty) return;
-      await _ingestFiles(input.files!);
-    });
+    // On web, use the html file input
+    if (kIsWeb) {
+      final input = html.FileUploadInputElement()
+        ..accept = '.xml,image/*'
+        ..multiple = true;
+      input.click();
+      input.onChange.first.then((_) async {
+        if (input.files == null || input.files!.isEmpty) return;
+        await _ingestFiles(input.files!);
+      });
+      return;
+    }
+
+    // On mobile/desktop, use file_picker
+    final result = await FilePicker.platform.pickFiles(
+      allowMultiple: true,
+      type: FileType.custom,
+      allowedExtensions: ['xml', 'jpg', 'jpeg', 'png', 'webp'],
+      withData: true,
+    );
+    if (result == null || result.files.isEmpty) return;
+
+    // Convert picked files to our html-like abstraction
+    final picked = <html.File>[];
+    for (final f in result.files) {
+      final name = (f.name).toLowerCase();
+      // Create minimal shim objects to pass through existing ingestion logic
+      picked.add(html.File(name));
+      if (name.endsWith('.xml') && f.bytes != null) {
+        // Directly load XML content by mocking FileReader behavior via helper
+        await _ingestPickedXml(String.fromCharCodes(f.bytes!));
+      } else if ((name.endsWith('.jpg') ||
+              name.endsWith('.jpeg') ||
+              name.endsWith('.png') ||
+              name.endsWith('.webp')) &&
+          f.bytes != null) {
+        // Store image bytes in Hive store for later use
+        await _storePickedImage(name, f.bytes!);
+      }
+    }
+
+    // After pre-processing, refresh UI if needed
+    setState(() {});
   }
 
   void _installDragDrop() {
@@ -326,6 +362,24 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
       await _fetchMissingCoversFromItunes();
       await _fetchMissingCoversFromTmdb();
     }
+  }
+
+  Future<void> _ingestPickedXml(String xmlContent) async {
+    _revokeObjectUrls();
+    _filenameToObjectUrl.clear();
+    _saveXml(xmlContent);
+    _loadFromXml(xmlContent);
+    _attachImagesToEntries();
+    await _fetchMissingCoversFromItunes();
+    await _fetchMissingCoversFromTmdb();
+  }
+
+  Future<void> _storePickedImage(String name, List<int> bytes) async {
+    final storedFiles = Map<String, dynamic>.from(
+      _box.get('image_files') ?? {},
+    );
+    storedFiles[name] = bytes;
+    await _box.put('image_files', storedFiles);
   }
 
   // duplicate function removed
@@ -1419,10 +1473,10 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
     final grid = GridView.builder(
       padding: const EdgeInsets.all(12),
       gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
-        maxCrossAxisExtent: 280,
-        mainAxisSpacing: 12,
-        crossAxisSpacing: 12,
-        childAspectRatio: 0.65,
+        maxCrossAxisExtent: 187,
+        mainAxisSpacing: 2,
+        crossAxisSpacing: 2,
+        childAspectRatio: 0.52,
       ),
       itemCount: _filtered.length,
       itemBuilder: (context, index) {
@@ -1430,7 +1484,7 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
         return InkWell(
           onTap: () {
             setState(() {
-              if (_watchNext.length < 10 && !_watchNext.contains(m)) {
+              if (_watchNext.length < 16 && !_watchNext.contains(m)) {
                 _watchNext.add(m);
               }
             });
@@ -1455,30 +1509,37 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
           ),
           const SizedBox(height: 4),
           Text(
-            '(choose up to ten)',
+            '(choose up to sixteen)',
             style: Theme.of(context).textTheme.bodySmall,
             textAlign: TextAlign.center,
           ),
           const SizedBox(height: 16),
-          Row(
-            mainAxisAlignment: MainAxisAlignment.center,
+          Wrap(
+            alignment: WrapAlignment.center,
+            spacing: 8,
+            runSpacing: 8,
             children: [
-              FilledButton.icon(
-                onPressed: _watchNext.isNotEmpty ? _pickFromWatchNext : null,
-                icon: const Icon(Icons.casino),
-                label: const Text('Random Choice'),
+              SizedBox(
+                width: 180,
+                child: FilledButton.icon(
+                  onPressed: _watchNext.isNotEmpty ? _pickFromWatchNext : null,
+                  icon: const Icon(Icons.casino),
+                  label: const Text('Random'),
+                ),
               ),
-              const SizedBox(width: 8),
-              FilledButton.icon(
-                onPressed: _watchNext.isNotEmpty
-                    ? () {
-                        setState(() {
-                          _watchNext.clear();
-                        });
-                      }
-                    : null,
-                icon: const Icon(Icons.delete_outline),
-                label: const Text('Clear'),
+              SizedBox(
+                width: 180,
+                child: FilledButton.icon(
+                  onPressed: _watchNext.isNotEmpty
+                      ? () {
+                          setState(() {
+                            _watchNext.clear();
+                          });
+                        }
+                      : null,
+                  icon: const Icon(Icons.delete_outline),
+                  label: const Text('Clear'),
+                ),
               ),
             ],
           ),
@@ -1501,12 +1562,12 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
     }
 
     return GridView.builder(
-      padding: const EdgeInsets.all(8),
+      padding: const EdgeInsets.all(2),
       gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
         crossAxisCount: 2,
         childAspectRatio: 0.75,
-        mainAxisSpacing: 8,
-        crossAxisSpacing: 8,
+        mainAxisSpacing: 2,
+        crossAxisSpacing: 2,
       ),
       itemCount: _watchNext.length,
       itemBuilder: (context, index) {
@@ -1580,7 +1641,7 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
             }).toList(),
           ),
         ),
-        const Spacer(),
+        const SizedBox(width: 12),
         Switch(
           value: _postersOnly,
           onChanged: (v) {
@@ -1658,7 +1719,7 @@ class _MovieCard extends StatelessWidget {
                   entry.title,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
-                  style: Theme.of(context).textTheme.titleMedium,
+                  style: Theme.of(context).textTheme.titleSmall,
                 ),
                 const SizedBox(height: 8),
                 Wrap(
@@ -1700,17 +1761,7 @@ class _Poster extends StatelessWidget {
         width: double.infinity,
         height: double.infinity,
         color: Colors.black26,
-        alignment: Alignment.center,
-        padding: const EdgeInsets.all(12),
-        child: Text(
-          title,
-          maxLines: 3,
-          overflow: TextOverflow.ellipsis,
-          textAlign: TextAlign.center,
-          style: Theme.of(
-            context,
-          ).textTheme.titleMedium?.copyWith(color: Colors.white70),
-        ),
+        child: const Icon(Icons.image_not_supported_outlined),
       );
     }
     return Image.network(
@@ -1718,9 +1769,20 @@ class _Poster extends StatelessWidget {
       fit: BoxFit.cover,
       width: double.infinity,
       height: double.infinity,
-      loadingBuilder: (context, child, loadingProgress) {
-        if (loadingProgress == null) return child;
-        return const Center(child: CircularProgressIndicator(strokeWidth: 2.0));
+      loadingBuilder: (context, child, progress) {
+        if (progress == null) return child;
+        return Center(
+          child: SizedBox(
+            width: 24,
+            height: 24,
+            child: CircularProgressIndicator(
+              value: progress.expectedTotalBytes != null
+                  ? progress.cumulativeBytesLoaded /
+                        (progress.expectedTotalBytes ?? 1)
+                  : null,
+            ),
+          ),
+        );
       },
       errorBuilder: (context, error, stackTrace) {
         print('IMAGE LOAD ERROR: $error - URL: $imageUrl');
@@ -1728,22 +1790,7 @@ class _Poster extends StatelessWidget {
           color: Colors.black38,
           alignment: Alignment.center,
           padding: const EdgeInsets.all(12),
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              const Icon(Icons.error_outline, color: Colors.white38, size: 32),
-              const SizedBox(height: 8),
-              Text(
-                title,
-                maxLines: 2,
-                overflow: TextOverflow.ellipsis,
-                textAlign: TextAlign.center,
-                style: Theme.of(
-                  context,
-                ).textTheme.bodySmall?.copyWith(color: Colors.white70),
-              ),
-            ],
-          ),
+          child: const Icon(Icons.broken_image_outlined),
         );
       },
     );
@@ -1950,7 +1997,7 @@ class _WatchNextCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Card(
-      margin: const EdgeInsets.only(bottom: 8),
+      margin: const EdgeInsets.only(bottom: 2),
       elevation: 0,
       color: Theme.of(
         context,
