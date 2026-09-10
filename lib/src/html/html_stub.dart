@@ -14,7 +14,7 @@ class FileUploadInputElement {
 
 class File {
   final String name;
-  File(this.name);
+  File(List<dynamic> fileBits, this.name);
 }
 
 class FileReader {

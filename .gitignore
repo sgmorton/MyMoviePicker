@@ -49,3 +49,7 @@ local.properties
 
 # Windows
 /windows/flutter/ephemeral/
+
+# Credentials & Secrets
+lib/secrets.dart
+

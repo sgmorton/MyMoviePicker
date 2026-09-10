@@ -8,11 +8,16 @@ import 'package:xml/xml.dart';
 import 'src/html/html_stub.dart' if (dart.library.html) 'dart:html' as html;
 import 'package:file_picker/file_picker.dart';
 import 'package:hive_flutter/hive_flutter.dart';
+import 'src/database/db_helper.dart';
+import 'package:simple_barcode_scanner/simple_barcode_scanner.dart';
+import 'secrets.dart';
+import 'src/services/invelos_scraper.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Hive.initFlutter();
-  await Hive.openBox('movie_picker');
+  final dbHelper = DbHelper();
+  await dbHelper.migrateFromHiveIfNeeded();
   runApp(const MyApp());
 }
 
@@ -41,19 +46,17 @@ class MyApp extends StatelessWidget {
 }
 
 class MovieEntry {
-  final String id;
-  final String title;
-  final String? year;
-  final String? genres;
-  final String? mediaType; // deprecated single type
-  final List<String>
-  mediaTypes; // normalized list (e.g., ['Blu-ray','DVD','4K'])
-  final String? runtime;
-  final String? frontImageFilename;
+  String id;
+  String title;
+  String? year;
+  String? genres;
+  String? mediaType; // deprecated single type
+  List<String> mediaTypes; // normalized list (e.g., ['Blu-ray','DVD','4K'])
+  String? runtime;
+  String? frontImageFilename;
   String imageUrl;
   String? mpaa; // G/PG/PG-13/R/...
-  bool
-  isCollectionParent; // true if this is a collection parent (hide children)
+  bool isCollectionParent; // true if this is a collection parent (hide children)
   String? collectionNumber; // Collection/BoxSet number for sorting
   String? overview;
   String? rottenTomatoesScore;
@@ -130,6 +133,8 @@ class MovieEntry {
   }
 
   factory MovieEntry.fromMap(Map<String, dynamic> map) {
+    final rawUrl = map['imageUrl'] as String? ?? '';
+    final sanitizedUrl = rawUrl.contains('invelos.com') ? '' : rawUrl;
     return MovieEntry(
       id: map['id'] as String,
       title: map['title'] as String,
@@ -141,7 +146,7 @@ class MovieEntry {
           const [],
       runtime: map['runtime'] as String?,
       frontImageFilename: map['frontImageFilename'] as String?,
-      imageUrl: map['imageUrl'] as String? ?? '',
+      imageUrl: sanitizedUrl,
       mpaa: map['mpaa'] as String?,
       isCollectionParent: map['isCollectionParent'] as bool? ?? false,
       collectionNumber: map['collectionNumber'] as String?,
@@ -168,7 +173,8 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
   bool _dragOver = false;
   final Map<String, String> _filenameToObjectUrl = {};
   final List<String> _createdObjectUrls = [];
-  late final Box _box;
+  final DbHelper _dbHelper = DbHelper();
+  String? _invelosUsername;
   String? _tmdbApiKey;
   String? _omdbApiKey;
   String _sortBy = 'Collection Number';
@@ -177,41 +183,39 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
   bool _isFetchingImages = false;
   double _fetchProgress = 0.0;
 
-  static const int _kDataVersion = 5;
+  static const int _kDataVersion = 9;
 
   final List<String> _allMediaTypes = const ['4K', 'Blu-ray', 'DVD', '3D'];
-  final Set<String> _selectedMediaTypes = {'4K', 'Blu-ray', '3D'};
+  final Set<String> _selectedMediaTypes = {'4K', 'Blu-ray', 'DVD', '3D'};
 
   final List<MovieEntry> _watchNext = [];
 
   @override
   void initState() {
     super.initState();
-    _box = Hive.box('movie_picker');
     _initialize();
   }
 
   void _initialize() async {
     // Check for data version and clear old data if necessary
-    final storedVersion = _box.get('data_version') as int? ?? 0;
+    final storedVersionStr = await _dbHelper.getSetting('data_version');
+    final storedVersion = storedVersionStr != null ? int.parse(storedVersionStr) : 0;
     if (storedVersion < _kDataVersion) {
       print(
         'Old data version ($storedVersion) found. Clearing cache to force re-parse from version $_kDataVersion.',
       );
-      await _box.delete('entries');
-      await _box.delete('image_files');
-      await _box.put(
-        'data_version',
-        _kDataVersion,
-      ); // Update version immediately
+      await _dbHelper.clearMovies();
+      await _dbHelper.clearCachedImages();
+      await _dbHelper.saveSetting('data_version', _kDataVersion.toString());
     }
 
-    _tmdbApiKey = _box.get('tmdb_api_key') as String?;
-    _omdbApiKey = _box.get('omdb_api_key') as String?;
-    _restoreFromStorage();
+    _invelosUsername = await _dbHelper.getSetting('invelos_username') ?? Secrets.invelosUsername;
+    _tmdbApiKey = await _dbHelper.getSetting('tmdb_api_key') ?? Secrets.tmdbApiKey;
+    _omdbApiKey = await _dbHelper.getSetting('omdb_api_key') ?? Secrets.omdbApiKey;
+    await _restoreFromStorage();
     // If we have no entries yet but have a saved XML, parse it now
     if (_all.isEmpty) {
-      final savedXml = _box.get('last_xml') as String?;
+      final savedXml = await _dbHelper.getSetting('last_xml');
       if (savedXml != null && savedXml.isNotEmpty) {
         print('No entries found. Reparsing last saved XML...');
         _loadFromXml(savedXml);
@@ -223,7 +227,7 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
   }
 
   void _triggerBackgroundFetch() async {
-    final toFetch = _all.where((e) => e.imageUrl.isEmpty).toList();
+    final toFetch = _all.where((e) => e.imageUrl.isEmpty || e.imageUrl.contains('invelos.com')).toList();
 
     if (toFetch.isNotEmpty) {
       print(
@@ -294,7 +298,7 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
     for (final f in result.files) {
       final name = (f.name).toLowerCase();
       // Create minimal shim objects to pass through existing ingestion logic
-      picked.add(html.File(name));
+      picked.add(html.File([], name));
       if (name.endsWith('.xml') && f.bytes != null) {
         // Directly load XML content by mocking FileReader behavior via helper
         await _ingestPickedXml(String.fromCharCodes(f.bytes!));
@@ -375,11 +379,7 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
   }
 
   Future<void> _storePickedImage(String name, List<int> bytes) async {
-    final storedFiles = Map<String, dynamic>.from(
-      _box.get('image_files') ?? {},
-    );
-    storedFiles[name] = bytes;
-    await _box.put('image_files', storedFiles);
+    await _dbHelper.cacheImage(name, bytes);
   }
 
   // duplicate function removed
@@ -387,25 +387,9 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
   Future<void> _fetchMissingCoversFromItunes() async {
     bool changed = false;
     for (final m in _all) {
-      if (m.imageUrl.isNotEmpty) continue;
-      final title = Uri.encodeQueryComponent(m.title);
-      final url =
-          'https://itunes.apple.com/search?term=$title&media=movie&entity=movie&limit=1';
-      try {
-        final resp = await http
-            .get(Uri.parse(url))
-            .timeout(const Duration(seconds: 10));
-        if (resp.statusCode == 200) {
-          final body = resp.body;
-          final art = _extractJsonString(body, 'artworkUrl100');
-          if (art != null && art.isNotEmpty) {
-            final highRes = art.replaceAll(RegExp(r"/\d+x\d+bb"), '/600x600bb');
-            m.imageUrl = highRes;
-            changed = true;
-          }
-        }
-      } catch (e, s) {
-        print('ITUNES FETCH ERROR for "$title": $e\n$s');
+      if (m.imageUrl.isNotEmpty && !m.imageUrl.contains('invelos.com')) continue;
+      if (await _fetchCoverFromItunesForMovie(m)) {
+        changed = true;
       }
     }
     if (changed) {
@@ -414,113 +398,222 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
     }
   }
 
-  Future<bool> _fetchCoverFromItunesForMovie(MovieEntry m) async {
-    if (m.imageUrl.isNotEmpty)
-      return false; // Already have an image, nothing to do.
-    final cleanTitle = m.title;
-    final title = Uri.encodeQueryComponent(cleanTitle);
-    final url =
-        'https://itunes.apple.com/search?term=$title&media=movie&entity=movie&limit=1';
-    try {
-      final resp = await http
-          .get(Uri.parse(url))
-          .timeout(const Duration(seconds: 10));
-      if (resp.statusCode == 200) {
-        final body = resp.body;
-        final art = _extractJsonString(body, 'artworkUrl100');
-        if (art != null && art.isNotEmpty) {
-          final highRes = art.replaceAll(RegExp(r"/\d+x\d+bb"), '/600x600bb');
-          m.imageUrl = highRes;
-          return true;
-        }
+  String _unescapeHtml(String input) {
+    return input
+        .replaceAll('&amp;', '&')
+        .replaceAll('&lt;', '<')
+        .replaceAll('&gt;', '>')
+        .replaceAll('&quot;', '"')
+        .replaceAll('&#39;', "'")
+        .replaceAll('&apos;', "'")
+        .replaceAll('&nbsp;', ' ');
+  }
+
+  String _cleanMainTitle(String rawTitle) {
+    var t = _unescapeHtml(rawTitle);
+    t = t.replaceAll(RegExp(r'\s*\([^)]*\)'), '');
+    t = t.replaceAll(RegExp(r'\s*\[[^\]]*\]'), '');
+    if (t.contains(':')) {
+      t = t.split(':').first;
+    } else if (t.contains(' - ')) {
+      t = t.split(' - ').first;
+    }
+    t = t.replaceAll(
+      RegExp(
+        r'\b(3D|4K|UHD|Ultra HD|Blu-ray|Bluray|DVD|Widescreen|Steelbook|Giftset|Collector\x27s Edition|Special Edition|Limited Edition|Anniversary Edition|Collection|Trilogy)\b',
+        caseSensitive: false,
+      ),
+      '',
+    );
+    return t.replaceAll(RegExp(r'\s+'), ' ').trim();
+  }
+
+  List<String> _getTitleCandidates(String rawTitle) {
+    final candidates = <String>[];
+    final unescaped = _unescapeHtml(rawTitle);
+    if (unescaped.isNotEmpty) candidates.add(unescaped);
+
+    final noParen = unescaped
+        .replaceAll(RegExp(r'\s*\([^)]*\)'), '')
+        .replaceAll(RegExp(r'\s*\[[^\]]*\]'), '')
+        .trim();
+    if (noParen.isNotEmpty && !candidates.contains(noParen)) {
+      candidates.add(noParen);
+    }
+
+    final mainTitle = _cleanMainTitle(rawTitle);
+    if (mainTitle.isNotEmpty && !candidates.contains(mainTitle)) {
+      candidates.add(mainTitle);
+    }
+
+    final noCollection = mainTitle
+        .replaceAll(RegExp(r'\b(Collection|Boxset|Box Set|Series|Set|Trilogy|Ultimate|Complete)\b', caseSensitive: false), '')
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
+    if (noCollection.isNotEmpty && !candidates.contains(noCollection)) {
+      candidates.add(noCollection);
+    }
+
+    if (mainTitle.contains(' & ')) {
+      final firstPart = mainTitle.split(' & ').first.replaceAll(RegExp(r'\s+\d+$'), '').trim();
+      if (firstPart.isNotEmpty && !candidates.contains(firstPart)) {
+        candidates.add(firstPart);
       }
-    } catch (e, s) {
-      print('ITUNES FETCH ERROR for "$title": $e\n$s');
+    }
+
+    return candidates;
+  }
+
+  Future<bool> _fetchCoverFromItunesForMovie(MovieEntry m) async {
+    if (m.imageUrl.isNotEmpty && !m.imageUrl.contains('invelos.com')) {
+      return false;
+    }
+    final candidates = _getTitleCandidates(m.title);
+    for (final candidate in candidates) {
+      final artUrl = await _queryItunesApi(candidate);
+      if (artUrl != null && artUrl.isNotEmpty) {
+        m.imageUrl = artUrl;
+        return true;
+      }
     }
     return false;
+  }
+
+  Future<String?> _queryItunesApi(String titleQuery) async {
+    final cleanTitle = _unescapeHtml(titleQuery);
+    final encoded = Uri.encodeQueryComponent(cleanTitle);
+    final url = 'https://itunes.apple.com/search?term=$encoded&media=movie&entity=movie&limit=1';
+    try {
+      final resp = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 10));
+      if (resp.statusCode == 200) {
+        final data = json.decode(resp.body);
+        if (data is Map && data['results'] is List) {
+          final results = data['results'] as List;
+          if (results.isNotEmpty && results.first is Map) {
+            final art = results.first['artworkUrl100'] as String?;
+            if (art != null && art.isNotEmpty) {
+              return art.replaceAll(RegExp(r"/\d+x\d+bb"), '/600x600bb');
+            }
+          }
+        }
+      }
+    } catch (e) {
+      print('iTunes query error for "$cleanTitle": $e');
+    }
+    return null;
   }
 
   Future<bool> _fetchCoverFromTmdbForMovie(MovieEntry m) async {
-    if (m.imageUrl.isNotEmpty)
-      return false; // Already have an image, nothing to do.
+    if (m.imageUrl.isNotEmpty && !m.imageUrl.contains('invelos.com')) {
+      return false; // Already have a verified poster image.
+    }
     if (_tmdbApiKey == null || _tmdbApiKey!.isEmpty) return false;
 
-    final cleanTitle = m.title;
-    final title = Uri.encodeQueryComponent(cleanTitle);
-    final year = m.year != null
-        ? '&year=${Uri.encodeQueryComponent(m.year!)}'
-        : '';
-    final url =
-        'https://api.themoviedb.org/3/search/movie?query=$title$year&api_key=$_tmdbApiKey';
-    try {
-      final resp = await http
-          .get(Uri.parse(url))
-          .timeout(const Duration(seconds: 10));
-      if (resp.statusCode == 200) {
-        final body = resp.body;
-        final path = _extractJsonString(body, 'poster_path');
+    final String? year = m.year;
+    final candidates = _getTitleCandidates(m.title);
 
-        if (path != null && path.isNotEmpty && path != 'null') {
-          m.imageUrl = 'https://image.tmdb.org/t/p/w342$path';
-          return true;
-        }
+    for (final candidate in candidates) {
+      String? poster = await _queryTmdbApi(candidate, year);
+      poster ??= await _queryTmdbApi(candidate, null);
+      if (poster != null && poster.isNotEmpty) {
+        m.imageUrl = poster;
+        return true;
       }
-    } catch (e, s) {
-      print('TMDB FETCH ERROR for "$title": $e\n$s');
     }
+
     return false;
   }
 
-  Future<bool> _fetchCoverFromOmdbForMovie(MovieEntry m) async {
-    // We might call this just for a score, so don't check for image url here.
-    final title = Uri.encodeQueryComponent(m.title);
-    final year = m.year != null
-        ? '&y=${Uri.encodeQueryComponent(m.year!)}'
-        : '';
-    final url = 'https://www.omdbapi.com/?apikey=$_omdbApiKey&t=$title$year';
+  Future<String?> _queryTmdbApi(String titleQuery, String? year) async {
+    final cleanTitle = _unescapeHtml(titleQuery);
+    final encodedTitle = Uri.encodeQueryComponent(cleanTitle);
+    final yearParam = (year != null && year.isNotEmpty) ? '&year=${Uri.encodeQueryComponent(year)}' : '';
+    final url = 'https://api.themoviedb.org/3/search/movie?query=$encodedTitle$yearParam&api_key=$_tmdbApiKey';
 
     try {
-      final resp = await http
-          .get(Uri.parse(url))
-          .timeout(const Duration(seconds: 10));
+      final resp = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 10));
       if (resp.statusCode == 200) {
-        final body = resp.body;
-        final data = jsonDecode(body);
-        if (data['Response'] == 'True') {
-          bool changed = false;
-          if (m.imageUrl.isEmpty &&
-              data['Poster'] != null &&
-              data['Poster'] != 'N/A') {
-            m.imageUrl = data['Poster'];
-            changed = true;
-          }
-          if ((m.overview == null || m.overview!.isEmpty) &&
-              data['Plot'] != null) {
-            m.overview = data['Plot'];
-            changed = true;
-          }
-
-          // Extract Rotten Tomatoes score
-          if ((m.rottenTomatoesScore == null ||
-                  m.rottenTomatoesScore!.isEmpty) &&
-              data['Ratings'] is List) {
-            final ratings = data['Ratings'] as List;
-            final rtRating = ratings.firstWhere(
-              (r) => r['Source'] == 'Rotten Tomatoes',
-              orElse: () => null,
-            );
-            if (rtRating != null) {
-              m.rottenTomatoesScore = rtRating['Value'];
-              print('Found RT score for ${m.title}: ${m.rottenTomatoesScore}');
-              changed = true;
+        final data = json.decode(resp.body);
+        if (data is Map && data['results'] is List) {
+          final results = data['results'] as List;
+          for (final r in results) {
+            if (r is Map) {
+              final posterPath = r['poster_path'] as String?;
+              if (posterPath != null && posterPath.isNotEmpty && posterPath != 'null') {
+                return 'https://image.tmdb.org/t/p/w342$posterPath';
+              }
             }
           }
-
-          return changed;
         }
       }
-    } catch (e, s) {
-      print('OMDB FETCH ERROR for "$title": $e\n$s');
+
+      // Fallback: TMDb Multi Search (supports TV series, box sets, and multi-format entries)
+      final multiUrl = 'https://api.themoviedb.org/3/search/multi?query=$encodedTitle&api_key=$_tmdbApiKey';
+      final multiResp = await http.get(Uri.parse(multiUrl)).timeout(const Duration(seconds: 10));
+      if (multiResp.statusCode == 200) {
+        final data = json.decode(multiResp.body);
+        if (data is Map && data['results'] is List) {
+          final results = data['results'] as List;
+          for (final r in results) {
+            if (r is Map) {
+              final posterPath = r['poster_path'] as String?;
+              if (posterPath != null && posterPath.isNotEmpty && posterPath != 'null') {
+                return 'https://image.tmdb.org/t/p/w342$posterPath';
+              }
+            }
+          }
+        }
+      }
+    } catch (e) {
+      print('TMDb query error for "$cleanTitle": $e');
+    }
+    return null;
+  }
+
+  Future<bool> _fetchCoverFromOmdbForMovie(MovieEntry m) async {
+    final candidates = _getTitleCandidates(m.title);
+    for (final candidate in candidates) {
+      final cleanTitle = _unescapeHtml(candidate);
+      final title = Uri.encodeQueryComponent(cleanTitle);
+      final year = m.year != null ? '&y=${Uri.encodeQueryComponent(m.year!)}' : '';
+      final url = 'https://www.omdbapi.com/?apikey=$_omdbApiKey&t=$title$year';
+
+      try {
+        final resp = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 10));
+        if (resp.statusCode == 200) {
+          final body = resp.body;
+          final data = jsonDecode(body);
+          if (data['Response'] == 'True') {
+            bool changed = false;
+            if ((m.imageUrl.isEmpty || m.imageUrl.contains('invelos.com')) &&
+                data['Poster'] != null &&
+                data['Poster'] != 'N/A') {
+              m.imageUrl = data['Poster'];
+              changed = true;
+            }
+            if ((m.overview == null || m.overview!.isEmpty) && data['Plot'] != null) {
+              m.overview = data['Plot'];
+              changed = true;
+            }
+            if ((m.rottenTomatoesScore == null || m.rottenTomatoesScore!.isEmpty) &&
+                data['Ratings'] is List) {
+              final ratings = data['Ratings'] as List;
+              final rtRating = ratings.firstWhere(
+                (r) => r['Source'] == 'Rotten Tomatoes',
+                orElse: () => null,
+              );
+              if (rtRating != null) {
+                m.rottenTomatoesScore = rtRating['Value'];
+                print('Found RT score for ${m.title}: ${m.rottenTomatoesScore}');
+                changed = true;
+              }
+            }
+            if (changed) return true;
+          }
+        }
+      } catch (e, s) {
+        print('OMDB FETCH ERROR for "$cleanTitle": $e\n$s');
+      }
     }
     return false;
   }
@@ -591,22 +684,18 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
       reader.readAsArrayBuffer(file);
       await reader.onLoad.first;
       final bytes = reader.result as List<int>;
-
-      final storedFiles = Map<String, dynamic>.from(
-        _box.get('image_files') ?? {},
-      );
-      storedFiles[file.name.toLowerCase()] = bytes;
-      _box.put('image_files', storedFiles);
+      await _dbHelper.cacheImage(file.name, bytes);
     } catch (e) {
       print('Failed to store image file ${file.name}: $e');
     }
   }
 
-  void _restoreObjectUrls() {
+  Future<void> _restoreObjectUrls() async {
     // Restore object URLs for local images from stored files
-    final storedFiles = _box.get('image_files') as Map<String, dynamic>?;
-    if (storedFiles == null) return;
+    final storedFiles = await _dbHelper.getAllCachedImages();
+    if (storedFiles.isEmpty) return;
 
+    bool anyChanged = false;
     for (final m in _all) {
       if (m.frontImageFilename == null) continue;
       final filename = _extractFilename(m.frontImageFilename!).toLowerCase();
@@ -617,14 +706,19 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
           final bytes = List<int>.from(fileData as List);
           final blob = html.Blob([bytes]);
           final url = html.Url.createObjectUrl(blob);
-          m.imageUrl = url;
+          if (m.imageUrl != url) {
+            m.imageUrl = url;
+            anyChanged = true;
+          }
           _createdObjectUrls.add(url);
         } catch (e) {
           print('Failed to restore image for $filename: $e');
         }
       }
     }
-    // Don't persist here as it might overwrite existing network URLs
+    if (anyChanged && mounted) {
+      setState(() {});
+    }
   }
 
   @override
@@ -714,15 +808,37 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
         ),
       );
     }
+    final uniqueItems = <MovieEntry>[];
+    final seenKeys = <String>{};
+    for (final item in items) {
+      final key = item.id.isNotEmpty ? item.id : '${item.title}_${item.year ?? ''}';
+      if (seenKeys.contains(key)) continue;
+      seenKeys.add(key);
+
+      final existingIndex = _all.indexWhere((existing) =>
+        (existing.id.isNotEmpty && existing.id == item.id) ||
+        (existing.title.toLowerCase().trim() == item.title.toLowerCase().trim() && existing.year == item.year)
+      );
+      if (existingIndex == -1) {
+        uniqueItems.add(item);
+      } else {
+        final existing = _all[existingIndex];
+        if (item.collectionNumber != null && item.collectionNumber!.isNotEmpty) {
+          existing.collectionNumber = item.collectionNumber;
+        }
+        if (item.overview != null && item.overview!.isNotEmpty) {
+          existing.overview = item.overview;
+        }
+      }
+    }
+
     setState(() {
-      _all
-        ..clear()
-        ..addAll(items);
+      _all.addAll(uniqueItems);
       _genres
         ..clear()
         ..add('All')
         ..addAll(
-          items
+          _all
               .expand((m) => (m.genres ?? '').split(',').map((s) => s.trim()))
               .where((s) => s.isNotEmpty),
         );
@@ -731,72 +847,32 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
     _persistEntries();
   }
 
-  void _saveXml(String content) {
-    _box.put('last_xml', content);
+  void _saveXml(String content) async {
+    await _dbHelper.saveSetting('last_xml', content);
   }
 
   Future<void> _persistEntries() async {
-    final data = _all
-        .map(
-          (m) => {
-            'id': m.id,
-            'title': m.title,
-            'year': m.year,
-            'genres': m.genres,
-            'mediaType': m.mediaType,
-            'mediaTypes': m.mediaTypes,
-            'runtime': m.runtime,
-            'frontImageFilename': m.frontImageFilename,
-            'imageUrl': m.imageUrl,
-            'mpaa': m.mpaa,
-            'isCollectionParent': m.isCollectionParent,
-            'collectionNumber': m.collectionNumber,
-            'overview': m.overview,
-            'rottenTomatoesScore': m.rottenTomatoesScore,
-          },
-        )
-        .toList();
+    final withImages = _all.where((m) => m.imageUrl.isNotEmpty).length;
+    print('Saving ${_all.length} items, $withImages with images to SQLite');
 
-    // Debug: Count items with images being saved
-    final withImages = data
-        .where((m) => (m['imageUrl'] as String).isNotEmpty)
-        .length;
-    print('Saving ${data.length} items, ${withImages} with images');
-
-    await _box.put('entries', data);
+    await _dbHelper.clearMovies();
+    await _dbHelper.insertMovies(_all);
   }
 
-  void _restoreFromStorage() {
-    final data = _box.get('entries') as List?;
-    if (data == null) return;
-    final items = <MovieEntry>[];
-    for (final raw in data) {
-      final map = Map<String, dynamic>.from(raw as Map);
-      items.add(
-        MovieEntry(
-          id: map['id'] as String,
-          title: map['title'] as String,
-          year: map['year'] as String?,
-          genres: map['genres'] as String?,
-          mediaType: map['mediaType'] as String?,
-          mediaTypes:
-              (map['mediaTypes'] as List?)?.map((e) => e.toString()).toList() ??
-              const [],
-          runtime: map['runtime'] as String?,
-          frontImageFilename: map['frontImageFilename'] as String?,
-          imageUrl: map['imageUrl'] as String? ?? '',
-          mpaa: map['mpaa'] as String?,
-          isCollectionParent: map['isCollectionParent'] as bool? ?? false,
-          collectionNumber: map['collectionNumber'] as String?,
-          overview: map['overview'],
-          rottenTomatoesScore: map['rottenTomatoesScore'],
-        ),
-      );
+  Future<void> _restoreFromStorage() async {
+    final items = await _dbHelper.getAllMovies();
+
+    bool sanitizedAny = false;
+    for (final m in items) {
+      if (m.imageUrl.contains('invelos.com')) {
+        m.imageUrl = '';
+        sanitizedAny = true;
+      }
     }
 
     // Debug: Count items with images
     final withImages = items.where((m) => m.imageUrl.isNotEmpty).length;
-    print('Restored ${items.length} items, ${withImages} with images');
+    print('Restored ${items.length} items, $withImages with valid images');
 
     setState(() {
       _all
@@ -811,10 +887,15 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
               .where((s) => s.isNotEmpty),
         );
       _applyFilters();
+      _isLoading = false;
     });
 
+    if (sanitizedAny) {
+      await _persistEntries();
+    }
+
     // Restore object URLs for local images
-    _restoreObjectUrls();
+    await _restoreObjectUrls();
 
     // If we have items but no images, try to fetch them
     _triggerBackgroundFetch();
@@ -824,27 +905,10 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
     if (_tmdbApiKey == null || _tmdbApiKey!.isEmpty) return;
     bool changed = false;
     for (final m in _all) {
-      if (m.imageUrl.isNotEmpty) continue;
-      final title = Uri.encodeQueryComponent(m.title);
-      final year = m.year != null
-          ? '&year=${Uri.encodeQueryComponent(m.year!)}'
-          : '';
-      final url =
-          'https://api.themoviedb.org/3/search/movie?query=$title$year&api_key=$_tmdbApiKey';
-      try {
-        final resp = await http
-            .get(Uri.parse(url))
-            .timeout(const Duration(seconds: 10));
-        if (resp.statusCode == 200) {
-          final body = resp.body;
-          final path = _extractJsonString(body, 'poster_path');
-          final mpaa = _extractJsonString(body, 'rating');
-          if (path != null && path.isNotEmpty && path != 'null') {
-            m.imageUrl = 'https://image.tmdb.org/t/p/w342$path';
-            changed = true;
-          }
-        }
-      } catch (_) {}
+      if (m.imageUrl.isNotEmpty && !m.imageUrl.contains('invelos.com')) continue;
+      if (await _fetchCoverFromTmdbForMovie(m)) {
+        changed = true;
+      }
     }
     if (changed) {
       setState(() {});
@@ -853,7 +917,7 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
   }
 
   Future<void> _refreshMissingImages() async {
-    final toFetch = _all.where((e) => e.imageUrl.isEmpty).toList();
+    final toFetch = _all.where((e) => e.imageUrl.isEmpty || e.imageUrl.contains('invelos.com')).toList();
     if (toFetch.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('No missing images to refresh!')),
@@ -1054,7 +1118,7 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
   }
 
   Future<void> _debugTronLegacy() async {
-    final lastXml = _box.get('last_xml') as String?;
+    final lastXml = await _dbHelper.getSetting('last_xml');
     if (lastXml == null || lastXml.isEmpty) {
       print('--- Cannot run debug: No XML has been loaded yet. ---');
       return;
@@ -1100,11 +1164,192 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
     print('\n--- DEBUGGING COMPLETE ---');
   }
 
+  void _syncInvelosCollection() async {
+    String? username = _invelosUsername;
+    if (username == null || username.trim().isEmpty) {
+      final controller = TextEditingController();
+      username = await showDialog<String>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('Invelos Username'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text('Enter your Invelos Profiler username to scrape your online collection:'),
+              const SizedBox(height: 12),
+              TextField(
+                controller: controller,
+                autofocus: true,
+                decoration: const InputDecoration(
+                  labelText: 'Username',
+                  hintText: 'e.g. sgmorton',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, null),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, controller.text.trim()),
+              child: const Text('Sync'),
+            ),
+          ],
+        ),
+      );
+
+      if (username == null || username.trim().isEmpty) return;
+
+      setState(() => _invelosUsername = username);
+      await _dbHelper.saveSetting('invelos_username', username);
+    }
+
+    if (!mounted) return;
+
+    // Progress Dialog state
+    String statusMessage = 'Connecting to Invelos Online...';
+    double? progressValue = 0.0;
+    StateSetter? dialogSetState;
+
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => StatefulBuilder(
+        builder: (context, setDialogState) {
+          dialogSetState = setDialogState;
+          return AlertDialog(
+            title: Row(
+              children: const [
+                Icon(Icons.cloud_download),
+                SizedBox(width: 12),
+                Text('Importing Collection'),
+              ],
+            ),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(statusMessage),
+                const SizedBox(height: 16),
+                LinearProgressIndicator(value: progressValue),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+
+    void updateProgress(String msg, double? val) {
+      print('[MoviePicker UI] Sync Progress: $msg ($val)');
+      if (dialogSetState != null) {
+        dialogSetState!(() {
+          statusMessage = msg;
+          progressValue = val;
+        });
+      }
+    }
+
+    try {
+      final scrapedEntries = await InvelosScraper.fetchCollection(
+        username,
+        onProgress: (msg, val) => updateProgress(msg, val),
+      );
+
+      updateProgress('Saving ${scrapedEntries.length} movies to database...', 0.9);
+
+      int addedCount = 0;
+      int updatedCount = 0;
+
+      for (final item in scrapedEntries) {
+        final existingIndex = _all.indexWhere((m) =>
+            (m.id.isNotEmpty && m.id == item.id) ||
+            (m.title.toLowerCase().trim() == item.title.toLowerCase().trim() && (m.year == item.year || m.year == null || item.year == null)));
+
+        if (existingIndex != -1) {
+          final existing = _all[existingIndex];
+          existing.collectionNumber = item.collectionNumber;
+          if (item.mediaTypes.isNotEmpty) {
+            existing.mediaTypes = item.mediaTypes;
+            existing.mediaType = item.mediaType;
+          }
+          if (existing.imageUrl.isEmpty && item.imageUrl.isNotEmpty) {
+            existing.imageUrl = item.imageUrl;
+          }
+          updatedCount++;
+        } else {
+          _all.add(item);
+          addedCount++;
+        }
+      }
+
+      setState(() {
+        _genres
+          ..clear()
+          ..add('All')
+          ..addAll(
+            _all
+                .expand((m) => (m.genres ?? '').split(',').map((s) => s.trim()))
+                .where((s) => s.isNotEmpty),
+          );
+        _applyFilters();
+      });
+
+      await _persistEntries();
+
+      // Dismiss progress dialog
+      if (mounted && Navigator.canPop(context)) {
+        Navigator.pop(context);
+      }
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Synced Invelos collection! Added $addedCount new, updated $updatedCount (Total: ${_all.length})'),
+            duration: const Duration(seconds: 4),
+          ),
+        );
+      }
+
+      _triggerBackgroundFetch();
+    } catch (e, stack) {
+      print('[MoviePicker UI] Sync Error: $e\n$stack');
+
+      // Dismiss progress dialog
+      if (mounted && Navigator.canPop(context)) {
+        Navigator.pop(context);
+      }
+
+      if (mounted) {
+        showDialog(
+          context: context,
+          builder: (context) => AlertDialog(
+            title: const Text('Import Details'),
+            content: SingleChildScrollView(
+              child: SelectableText(
+                'Invelos Sync Result:\n\n$e',
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text('Close'),
+              ),
+            ],
+          ),
+        );
+      }
+    }
+  }
+
   void _openSettings() async {
     final result = await showDialog<Map<String, String>>(
       context: context,
       builder: (context) {
         return _SettingsDialog(
+          initialInvelosUsername: _invelosUsername,
           initialTmdbApiKey: _tmdbApiKey,
           initialOmdbApiKey: _omdbApiKey,
         );
@@ -1112,23 +1357,414 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
     );
 
     if (result != null) {
-      // Use setState to update the UI and trigger a rebuild
       setState(() {
+        _invelosUsername = result['invelos'];
         _tmdbApiKey = result['tmdb'];
         _omdbApiKey = result['omdb'];
       });
-      // Persist the keys to storage
-      await _box.put('tmdb_api_key', _tmdbApiKey);
-      await _box.put('omdb_api_key', _omdbApiKey);
+      await _dbHelper.saveSetting('invelos_username', _invelosUsername ?? '');
+      await _dbHelper.saveSetting('tmdb_api_key', _tmdbApiKey ?? '');
+      await _dbHelper.saveSetting('omdb_api_key', _omdbApiKey ?? '');
 
-      // Optionally, show a confirmation and refresh images
       if (mounted) {
         ScaffoldMessenger.of(
           context,
-        ).showSnackBar(const SnackBar(content: Text('API Keys saved!')));
+        ).showSnackBar(const SnackBar(content: Text('Settings saved!')));
         await _refreshMissingImages();
       }
     }
+  }
+
+  String _getNextCollectionNumber() {
+    int maxNum = 9999;
+    for (final m in _all) {
+      if (m.collectionNumber != null) {
+        final parsed = int.tryParse(m.collectionNumber!);
+        if (parsed != null && parsed > maxNum) {
+          maxNum = parsed;
+        }
+      }
+    }
+    return (maxNum + 1).toString();
+  }
+
+  void _addMovieFlow() {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Add New Movie'),
+        content: const Text('Would you like to scan a barcode or enter the movie details manually?'),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.pop(context);
+              _enterMovieManually();
+            },
+            child: const Text('Enter Manually'),
+          ),
+          ElevatedButton.icon(
+            onPressed: () {
+              Navigator.pop(context);
+              _scanMovieBarcode();
+            },
+            icon: const Icon(Icons.qr_code_scanner),
+            label: const Text('Scan Barcode'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _scanMovieBarcode() async {
+    final res = await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (context) => const SimpleBarcodeScannerPage(),
+      ),
+    );
+
+    if (res is String && res.isNotEmpty && res != '-1') {
+      print('Scanned barcode: $res');
+      _lookupBarcodeAndConfirm(res);
+    }
+  }
+
+  void _lookupBarcodeAndConfirm(String barcode) async {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => const Center(
+        child: Card(
+          child: Padding(
+            padding: EdgeInsets.all(20),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                CircularProgressIndicator(),
+                SizedBox(height: 12),
+                Text('Looking up barcode...'),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+
+    final url = 'https://api.upcitemdb.com/prod/trial/lookup?upc=$barcode';
+    try {
+      final resp = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 10));
+      if (!mounted) return;
+      Navigator.pop(context); // Close loading dialog
+
+      if (resp.statusCode == 200) {
+        final data = jsonDecode(resp.body);
+        if (data['items'] != null && (data['items'] as List).isNotEmpty) {
+          final item = data['items'][0];
+          final title = item['title'] as String;
+          print('Found title from barcode: $title');
+
+          // Check if this title (or ID) already exists in our movie collection
+          final duplicate = _all.firstWhere(
+            (m) => m.id == barcode || m.title.toLowerCase().trim() == title.toLowerCase().trim(),
+            orElse: () => MovieEntry(id: '', title: '', imageUrl: ''),
+          );
+
+          if (duplicate.id.isNotEmpty) {
+            _showDuplicateWarning(duplicate);
+            return;
+          }
+
+          // Create a MovieEntry with fetched info and let user edit/confirm
+          final newMovie = MovieEntry(
+            id: barcode,
+            title: title,
+            imageUrl: '',
+            mediaType: 'Blu-ray',
+            mediaTypes: ['Blu-ray'],
+            collectionNumber: _getNextCollectionNumber(),
+          );
+
+          // Enrich details
+          await _enrichMovieMetadata(newMovie);
+
+          _showEditMovieDialog(newMovie, isNew: true);
+        } else {
+          _showErrorSnackBar('Barcode not found in database.');
+          _showEditMovieDialog(
+            MovieEntry(
+              id: barcode,
+              title: '',
+              imageUrl: '',
+              mediaType: 'Blu-ray',
+              mediaTypes: ['Blu-ray'],
+              collectionNumber: _getNextCollectionNumber(),
+            ),
+            isNew: true,
+          );
+        }
+      } else {
+        _showErrorSnackBar('Barcode lookup failed (status ${resp.statusCode}).');
+        _showEditMovieDialog(
+          MovieEntry(
+            id: barcode,
+            title: '',
+            imageUrl: '',
+            mediaType: 'Blu-ray',
+            mediaTypes: ['Blu-ray'],
+            collectionNumber: _getNextCollectionNumber(),
+          ),
+          isNew: true,
+        );
+      }
+    } catch (e) {
+      if (mounted) Navigator.pop(context); // Close loading dialog
+      _showErrorSnackBar('Network error: $e');
+      _showEditMovieDialog(
+        MovieEntry(
+          id: barcode,
+          title: '',
+          imageUrl: '',
+          mediaType: 'Blu-ray',
+          mediaTypes: ['Blu-ray'],
+          collectionNumber: _getNextCollectionNumber(),
+        ),
+        isNew: true,
+      );
+    }
+  }
+
+  Future<void> _enrichMovieMetadata(MovieEntry movie) async {
+    String cleanTitle = movie.title;
+    cleanTitle = cleanTitle
+        .replaceAll(RegExp(r"\b(Blu-ray|DVD|4K|Ultra HD|Special Edition|Collector's Edition|Combo Pack|Widescreen)\b", caseSensitive: false), '')
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
+
+    final originalTitle = movie.title;
+    movie.title = cleanTitle;
+
+    // Fetch details
+    await _fetchCoverFromTmdbForMovie(movie);
+    await _fetchCoverFromItunesForMovie(movie);
+    await _fetchCoverFromOmdbForMovie(movie);
+
+    if (movie.imageUrl.isEmpty) {
+      movie.title = originalTitle;
+    }
+  }
+
+  void _showEditMovieDialog(MovieEntry movie, {required bool isNew}) {
+    final titleCtrl = TextEditingController(text: movie.title);
+    final yearCtrl = TextEditingController(text: movie.year ?? '');
+    final genresCtrl = TextEditingController(text: movie.genres ?? '');
+    final collectionNumCtrl = TextEditingController(
+      text: movie.collectionNumber ?? (isNew ? _getNextCollectionNumber() : ''),
+    );
+    final overviewCtrl = TextEditingController(text: movie.overview ?? '');
+    final rtScoreCtrl = TextEditingController(text: movie.rottenTomatoesScore ?? '');
+    final imageUrlCtrl = TextEditingController(text: movie.imageUrl);
+    String selectedMediaType = movie.mediaType ?? 'Blu-ray';
+
+    showDialog(
+      context: context,
+      builder: (context) {
+        return StatefulBuilder(
+          builder: (context, setStateDialog) {
+            return AlertDialog(
+              title: Text(isNew ? 'Confirm/Add Movie' : 'Edit Movie'),
+              content: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    TextField(
+                      controller: titleCtrl,
+                      decoration: const InputDecoration(labelText: 'Title *'),
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: TextField(
+                            controller: yearCtrl,
+                            decoration: const InputDecoration(labelText: 'Year'),
+                            keyboardType: TextInputType.number,
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: TextField(
+                            controller: collectionNumCtrl,
+                            decoration: const InputDecoration(labelText: 'Collection #'),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: genresCtrl,
+                      decoration: const InputDecoration(labelText: 'Genres (comma separated)'),
+                    ),
+                    const SizedBox(height: 8),
+                    DropdownButtonFormField<String>(
+                      value: selectedMediaType,
+                      decoration: const InputDecoration(labelText: 'Media Type'),
+                      items: const [
+                        DropdownMenuItem(value: '4K', child: Text('4K')),
+                        DropdownMenuItem(value: 'Blu-ray', child: Text('Blu-ray')),
+                        DropdownMenuItem(value: 'DVD', child: Text('DVD')),
+                        DropdownMenuItem(value: '3D', child: Text('3D')),
+                      ],
+                      onChanged: (val) {
+                        if (val != null) {
+                          setStateDialog(() {
+                            selectedMediaType = val;
+                          });
+                        }
+                      },
+                    ),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: rtScoreCtrl,
+                      decoration: const InputDecoration(labelText: 'Rotten Tomatoes Score'),
+                    ),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: imageUrlCtrl,
+                      decoration: const InputDecoration(labelText: 'Cover Image URL'),
+                    ),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: overviewCtrl,
+                      decoration: const InputDecoration(labelText: 'Overview/Plot'),
+                      maxLines: 3,
+                    ),
+                  ],
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(context),
+                  child: const Text('Cancel'),
+                ),
+                ElevatedButton(
+                  onPressed: () async {
+                    if (titleCtrl.text.trim().isEmpty) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(content: Text('Title is required.')),
+                      );
+                      return;
+                    }
+
+                    movie.title = titleCtrl.text.trim();
+                    movie.year = yearCtrl.text.trim().isEmpty ? null : yearCtrl.text.trim();
+                    movie.genres = genresCtrl.text.trim().isEmpty ? null : genresCtrl.text.trim();
+                    movie.collectionNumber = collectionNumCtrl.text.trim().isEmpty 
+                        ? null 
+                        : collectionNumCtrl.text.trim();
+                    movie.mediaType = selectedMediaType;
+                    movie.mediaTypes = [selectedMediaType];
+                    movie.rottenTomatoesScore = rtScoreCtrl.text.trim().isEmpty ? null : rtScoreCtrl.text.trim();
+                    movie.imageUrl = imageUrlCtrl.text.trim();
+                    movie.overview = overviewCtrl.text.trim().isEmpty ? null : overviewCtrl.text.trim();
+
+                    if (movie.id.isEmpty) {
+                      movie.id = 'manual_${DateTime.now().millisecondsSinceEpoch}';
+                    }
+
+                    Navigator.pop(context);
+
+                    final duplicate = _all.firstWhere(
+                      (m) => m.id != movie.id && m.title.toLowerCase().trim() == movie.title.toLowerCase().trim() && m.year == movie.year,
+                      orElse: () => MovieEntry(id: '', title: '', imageUrl: ''),
+                    );
+                    if (duplicate.id.isNotEmpty) {
+                      _showDuplicateWarning(duplicate);
+                      return;
+                    }
+
+                    setState(() {
+                      if (isNew) {
+                        _all.add(movie);
+                      } else {
+                        final idx = _all.indexWhere((m) => m.id == movie.id);
+                        if (idx != -1) {
+                          _all[idx] = movie;
+                        }
+                      }
+                      _applyFilters();
+                    });
+
+                    await _dbHelper.insertMovie(movie);
+                    _showSuccessSnackBar(isNew ? 'Movie added successfully!' : 'Movie updated successfully!');
+                  },
+                  child: const Text('Save'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+  }
+
+  void _enterMovieManually() {
+    _showEditMovieDialog(
+      MovieEntry(
+        id: '',
+        title: '',
+        imageUrl: '',
+        mediaType: 'Blu-ray',
+        mediaTypes: ['Blu-ray'],
+        collectionNumber: _getNextCollectionNumber(),
+      ),
+      isNew: true,
+    );
+  }
+
+  void _showDuplicateWarning(MovieEntry duplicate) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Duplicate Movie'),
+        content: Text(
+          'A movie with the title "${duplicate.title}" '
+          '${duplicate.year != null ? "(${duplicate.year}) " : ""}'
+          'already exists in your collection (Collection #${duplicate.collectionNumber ?? "N/A"}).\n\n'
+          'Do you still want to view or edit the existing movie?',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Close'),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              Navigator.pop(context);
+              _showEditMovieDialog(duplicate, isNew: false);
+            },
+            child: const Text('Edit Existing'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showErrorSnackBar(String message) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        backgroundColor: Colors.redAccent,
+      ),
+    );
+  }
+
+  void _showSuccessSnackBar(String message) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        backgroundColor: Colors.teal,
+      ),
+    );
   }
 
   String? _firstText(
@@ -1402,8 +2038,32 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Movie Picker'),
+        title: FittedBox(
+          fit: BoxFit.scaleDown,
+          alignment: Alignment.centerLeft,
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              ClipRRect(
+                borderRadius: BorderRadius.circular(6),
+                child: Image.asset(
+                  'assets/app_icon.png',
+                  width: 26,
+                  height: 26,
+                  errorBuilder: (_, __, ___) => const Icon(Icons.movie, size: 24),
+                ),
+              ),
+              const SizedBox(width: 8),
+              const Text('Movie Picker'),
+            ],
+          ),
+        ),
         actions: [
+          IconButton(
+            tooltip: 'Sync Invelos Online',
+            onPressed: _syncInvelosCollection,
+            icon: const Icon(Icons.cloud_download),
+          ),
           IconButton(
             tooltip: 'Refresh Missing Images',
             onPressed: _refreshMissingImages,
@@ -1413,6 +2073,11 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
             tooltip: 'Settings',
             onPressed: _openSettings,
             icon: const Icon(Icons.settings),
+          ),
+          IconButton(
+            tooltip: 'Add Movie',
+            onPressed: _addMovieFlow,
+            icon: const Icon(Icons.add),
           ),
           IconButton(
             tooltip: 'Open XML',
@@ -1427,56 +2092,78 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
                 highlight: _dragOver,
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
-                  children: const [
-                    Icon(Icons.cloud_upload, size: 48),
-                    SizedBox(height: 12),
-                    Text(
+                  children: [
+                    const Icon(Icons.cloud_upload, size: 48),
+                    const SizedBox(height: 12),
+                    const Text(
                       'Drop your DVD Profiler XML here or click the upload icon',
+                    ),
+                    const SizedBox(height: 16),
+                    FilledButton.icon(
+                      onPressed: _syncInvelosCollection,
+                      icon: const Icon(Icons.cloud_download),
+                      label: const Text('Sync from Invelos Online'),
                     ),
                   ],
                 ),
               ),
             )
-          : Row(
-              children: [
-                Expanded(
-                  flex: 3,
-                  child: Column(
+          : LayoutBuilder(
+              builder: (context, constraints) {
+                final isMobile = constraints.maxWidth < 700;
+                if (isMobile) {
+                  return Column(
                     children: [
                       Padding(
-                        padding: const EdgeInsets.all(12),
+                        padding: const EdgeInsets.fromLTRB(6, 4, 6, 4),
                         child: _buildFilterBar(),
                       ),
                       Expanded(child: _buildBody()),
                     ],
-                  ),
-                ),
-                // Watch Next Panel
-                Expanded(
-                  flex: 1,
-                  child: Container(
-                    color: Theme.of(context).colorScheme.surfaceContainer,
-                    child: Column(
-                      children: [
-                        _buildWatchNextHeader(),
-                        Expanded(child: _buildWatchNextList()),
-                      ],
+                  );
+                }
+                return Row(
+                  children: [
+                    Expanded(
+                      flex: 3,
+                      child: Column(
+                        children: [
+                          Padding(
+                            padding: const EdgeInsets.fromLTRB(8, 6, 8, 4),
+                            child: _buildFilterBar(),
+                          ),
+                          Expanded(child: _buildBody()),
+                        ],
+                      ),
                     ),
-                  ),
-                ),
-              ],
+                    // Watch Next Panel
+                    Expanded(
+                      flex: 1,
+                      child: Container(
+                        color: Theme.of(context).colorScheme.surfaceContainer,
+                        child: Column(
+                          children: [
+                            _buildWatchNextHeader(),
+                            Expanded(child: _buildWatchNextList()),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
+                );
+              },
             ),
     );
   }
 
   Widget _buildBody() {
     final grid = GridView.builder(
-      padding: const EdgeInsets.all(12),
+      padding: const EdgeInsets.all(6),
       gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
-        maxCrossAxisExtent: 187,
-        mainAxisSpacing: 2,
-        crossAxisSpacing: 2,
-        childAspectRatio: 0.52,
+        maxCrossAxisExtent: 155,
+        mainAxisSpacing: 6,
+        crossAxisSpacing: 6,
+        childAspectRatio: 0.64,
       ),
       itemCount: _filtered.length,
       itemBuilder: (context, index) {
@@ -1585,98 +2272,141 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
   }
 
   Widget _buildFilterBar() {
-    return Wrap(
-      crossAxisAlignment: WrapCrossAlignment.center,
-      spacing: 12,
-      runSpacing: 12,
-      children: [
-        ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 380),
-          child: TextField(
-            onChanged: (v) {
-              _query = v;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      decoration: BoxDecoration(
+        color: Theme.of(context).colorScheme.surfaceContainerHighest.withOpacity(0.4),
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Wrap(
+        crossAxisAlignment: WrapCrossAlignment.center,
+        alignment: WrapAlignment.start,
+        spacing: 8,
+        runSpacing: 6,
+        children: [
+          ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 200),
+            child: SizedBox(
+              height: 36,
+              child: TextField(
+                onChanged: (v) {
+                  _query = v;
+                  _applyFilters();
+                },
+                style: const TextStyle(fontSize: 13),
+                decoration: const InputDecoration(
+                  prefixIcon: Icon(Icons.search, size: 18),
+                  hintText: 'Search title...',
+                  contentPadding: EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+                  isDense: true,
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.all(Radius.circular(8)),
+                  ),
+                ),
+              ),
+            ),
+          ),
+          Container(
+            height: 36,
+            padding: const EdgeInsets.symmetric(horizontal: 8),
+            decoration: BoxDecoration(
+              border: Border.all(color: Colors.white24),
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: DropdownButtonHideUnderline(
+              child: DropdownButton<String>(
+                value: _genreFilter,
+                isDense: true,
+                style: const TextStyle(fontSize: 13, color: Colors.white),
+                items: _genres
+                    .map((g) => DropdownMenuItem(value: g, child: Text(g)))
+                    .toList(),
+                onChanged: (v) {
+                  if (v == null) return;
+                  setState(() => _genreFilter = v);
+                  _applyFilters();
+                },
+              ),
+            ),
+          ),
+          Container(
+            height: 36,
+            padding: const EdgeInsets.symmetric(horizontal: 8),
+            decoration: BoxDecoration(
+              border: Border.all(color: Colors.white24),
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: DropdownButtonHideUnderline(
+              child: DropdownButton<String>(
+                value: _sortBy,
+                isDense: true,
+                style: const TextStyle(fontSize: 13, color: Colors.white),
+                items: const [
+                  DropdownMenuItem(
+                    value: 'Collection Number',
+                    child: Text('Sort: Col #'),
+                  ),
+                  DropdownMenuItem(
+                    value: 'Media Type',
+                    child: Text('Sort: Media'),
+                  ),
+                  DropdownMenuItem(value: 'Title', child: Text('Sort: Title')),
+                  DropdownMenuItem(value: 'Year', child: Text('Sort: Year')),
+                  DropdownMenuItem(value: 'Runtime', child: Text('Sort: Runtime')),
+                ],
+                onChanged: (v) {
+                  if (v == null) return;
+                  setState(() => _sortBy = v);
+                  _applyFilters();
+                },
+              ),
+            ),
+          ),
+          ..._allMediaTypes.map((type) {
+            final isSelected = _selectedMediaTypes.contains(type);
+            return FilterChip(
+              label: Text(type, style: const TextStyle(fontSize: 11)),
+              selected: isSelected,
+              visualDensity: VisualDensity.compact,
+              materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 0),
+              onSelected: (selected) {
+                setState(() {
+                  if (selected) {
+                    _selectedMediaTypes.add(type);
+                  } else {
+                    _selectedMediaTypes.remove(type);
+                  }
+                  _applyFilters();
+                });
+              },
+            );
+          }),
+          FilterChip(
+            label: const Text('Posters Only', style: TextStyle(fontSize: 11)),
+            selected: _postersOnly,
+            visualDensity: VisualDensity.compact,
+            materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 0),
+            onSelected: (v) {
+              setState(() => _postersOnly = v);
               _applyFilters();
             },
-            decoration: const InputDecoration(
-              prefixIcon: Icon(Icons.search),
-              hintText: 'Search title or genre',
-              border: OutlineInputBorder(),
+          ),
+          SizedBox(
+            height: 36,
+            child: FilledButton.tonalIcon(
+              onPressed: _randomPick,
+              style: FilledButton.styleFrom(
+                padding: const EdgeInsets.symmetric(horizontal: 10),
+                visualDensity: VisualDensity.compact,
+              ),
+              icon: const Icon(Icons.casino, size: 16),
+              label: const Text('Surprise', style: TextStyle(fontSize: 12)),
             ),
           ),
-        ),
-        DropdownButton<String>(
-          value: _genreFilter,
-          items: _genres
-              .map((g) => DropdownMenuItem(value: g, child: Text(g)))
-              .toList(),
-          onChanged: (v) {
-            if (v == null) return;
-            setState(() => _genreFilter = v);
-            _applyFilters();
-          },
-        ),
-        const SizedBox(width: 16),
-        SingleChildScrollView(
-          scrollDirection: Axis.horizontal,
-          child: Row(
-            children: _allMediaTypes.map((type) {
-              final isSelected = _selectedMediaTypes.contains(type);
-              return Padding(
-                padding: const EdgeInsets.only(right: 8.0),
-                child: FilterChip(
-                  label: Text(type),
-                  selected: isSelected,
-                  onSelected: (selected) {
-                    setState(() {
-                      if (selected) {
-                        _selectedMediaTypes.add(type);
-                      } else {
-                        _selectedMediaTypes.remove(type);
-                      }
-                      _applyFilters();
-                    });
-                  },
-                ),
-              );
-            }).toList(),
-          ),
-        ),
-        const SizedBox(width: 12),
-        Switch(
-          value: _postersOnly,
-          onChanged: (v) {
-            setState(() => _postersOnly = v);
-            _applyFilters();
-          },
-        ),
-        const Text('Posters only'),
-        DropdownButton<String>(
-          value: _sortBy,
-          items: const [
-            DropdownMenuItem(
-              value: 'Collection Number',
-              child: Text('Sort: Collection Number'),
-            ),
-            DropdownMenuItem(
-              value: 'Media Type',
-              child: Text('Sort: Media Type'),
-            ),
-            DropdownMenuItem(value: 'Title', child: Text('Sort: Title')),
-            DropdownMenuItem(value: 'Year', child: Text('Sort: Year')),
-            DropdownMenuItem(value: 'Runtime', child: Text('Sort: Runtime')),
-          ],
-          onChanged: (v) {
-            if (v == null) return;
-            setState(() => _sortBy = v);
-            _applyFilters();
-          },
-        ),
-        FilledButton.icon(
-          onPressed: _randomPick,
-          icon: const Icon(Icons.casino),
-          label: const Text('Surprise Me'),
-        ),
-      ],
+        ],
+      ),
     );
   }
 }
@@ -1688,56 +2418,65 @@ class _MovieCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Card(
-      elevation: 0,
-      color: Theme.of(
-        context,
-      ).colorScheme.surfaceContainerHighest.withOpacity(0.6),
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+      elevation: 2,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
       clipBehavior: Clip.antiAlias,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Expanded(
-            flex: 2,
             child: Stack(
               children: [
                 _Poster(imageUrl: entry.imageUrl, title: entry.title),
                 Positioned(
-                  top: 8,
-                  left: 8,
+                  top: 4,
+                  left: 4,
                   child: _CollectionNumberBadge(value: entry.collectionNumber),
                 ),
               ],
             ),
           ),
-          Padding(
-            padding: const EdgeInsets.all(12),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+            color: Theme.of(context).colorScheme.surfaceContainerHighest.withOpacity(0.9),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
               children: [
                 Text(
                   entry.title,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
-                  style: Theme.of(context).textTheme.titleSmall,
+                  style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold),
                 ),
-                const SizedBox(height: 8),
-                Wrap(
-                  spacing: 8,
-                  runSpacing: 4,
+                const SizedBox(height: 2),
+                Row(
                   children: [
-                    if ((entry.runtime ?? '').isNotEmpty)
-                      _Chip(label: '${entry.runtime} min'),
-                    if ((entry.mpaa ?? '').isNotEmpty)
-                      _Chip(label: entry.mpaa!),
-                    ...entry.mediaTypes
-                        .where(
-                          (t) =>
-                              t.trim().isNotEmpty &&
-                              t.toLowerCase() != 'true' &&
-                              t.toLowerCase() != 'false',
-                        )
-                        .map((t) => _MediaTypeChip(label: t)),
+                    if ((entry.year ?? '').isNotEmpty)
+                      Text(
+                        entry.year!,
+                        style: TextStyle(fontSize: 9, color: Colors.grey[400]),
+                      ),
+                    const Spacer(),
+                    Flexible(
+                      child: ClipRect(
+                        child: SingleChildScrollView(
+                          scrollDirection: Axis.horizontal,
+                          physics: const NeverScrollableScrollPhysics(),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: entry.mediaTypes
+                                .where((t) => t.trim().isNotEmpty && t.toLowerCase() != 'true' && t.toLowerCase() != 'false')
+                                .take(2)
+                                .map((t) => Padding(
+                                      padding: const EdgeInsets.only(left: 2),
+                                      child: _MediaTypeChip(label: t),
+                                    ))
+                                .toList(),
+                          ),
+                        ),
+                      ),
+                    ),
                   ],
                 ),
               ],
@@ -1756,7 +2495,7 @@ class _Poster extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    if (imageUrl.isEmpty) {
+    if (imageUrl.isEmpty || imageUrl.contains('invelos.com')) {
       return Container(
         width: double.infinity,
         height: double.infinity,
@@ -1830,12 +2569,15 @@ class _Chip extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
       decoration: BoxDecoration(
         color: Theme.of(context).colorScheme.primary.withOpacity(0.15),
-        borderRadius: BorderRadius.circular(999),
+        borderRadius: BorderRadius.circular(4),
       ),
-      child: Text(label, style: Theme.of(context).textTheme.labelSmall),
+      child: Text(
+        label,
+        style: const TextStyle(fontSize: 8.5, fontWeight: FontWeight.bold, height: 1.1),
+      ),
     );
   }
 }
@@ -1850,28 +2592,31 @@ class _MediaTypeChip extends StatelessWidget {
     Color bg;
     Color border;
     if (lower.contains('blu')) {
-      bg = Colors.blue.withOpacity(0.20);
-      border = Colors.blue.withOpacity(0.35);
+      bg = Colors.blue.withOpacity(0.25);
+      border = Colors.blue.withOpacity(0.50);
     } else if (lower.contains('4k') || lower.contains('ultra')) {
-      bg = Colors.red.withOpacity(0.20);
-      border = Colors.red.withOpacity(0.35);
+      bg = Colors.red.withOpacity(0.25);
+      border = Colors.red.withOpacity(0.50);
     } else if (lower.contains('3d')) {
-      bg = Colors.green.withOpacity(0.20);
-      border = Colors.green.withOpacity(0.35);
+      bg = Colors.green.withOpacity(0.25);
+      border = Colors.green.withOpacity(0.50);
     } else {
       bg = Theme.of(
         context,
-      ).colorScheme.surfaceContainerHighest.withOpacity(0.25);
+      ).colorScheme.surfaceContainerHighest.withOpacity(0.40);
       border = Colors.white24;
     }
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 1),
       decoration: BoxDecoration(
         color: bg,
-        borderRadius: BorderRadius.circular(999),
-        border: Border.all(color: border),
+        borderRadius: BorderRadius.circular(3),
+        border: Border.all(color: border, width: 0.7),
       ),
-      child: Text(label, style: Theme.of(context).textTheme.labelSmall),
+      child: Text(
+        label,
+        style: const TextStyle(fontSize: 8.0, fontWeight: FontWeight.bold, height: 1.0, letterSpacing: -0.2),
+      ),
     );
   }
 }
@@ -1910,22 +2655,31 @@ class DottedBorderContainer extends StatelessWidget {
 }
 
 class _SettingsDialog extends StatefulWidget {
+  final String? initialInvelosUsername;
   final String? initialTmdbApiKey;
   final String? initialOmdbApiKey;
 
-  const _SettingsDialog({this.initialTmdbApiKey, this.initialOmdbApiKey});
+  const _SettingsDialog({
+    this.initialInvelosUsername,
+    this.initialTmdbApiKey,
+    this.initialOmdbApiKey,
+  });
 
   @override
   State<_SettingsDialog> createState() => _SettingsDialogState();
 }
 
 class _SettingsDialogState extends State<_SettingsDialog> {
+  late final TextEditingController _invelosController;
   late final TextEditingController _tmdbController;
   late final TextEditingController _omdbController;
 
   @override
   void initState() {
     super.initState();
+    _invelosController = TextEditingController(
+      text: widget.initialInvelosUsername ?? '',
+    );
     _tmdbController = TextEditingController(
       text: widget.initialTmdbApiKey ?? '',
     );
@@ -1936,6 +2690,7 @@ class _SettingsDialogState extends State<_SettingsDialog> {
 
   @override
   void dispose() {
+    _invelosController.dispose();
     _tmdbController.dispose();
     _omdbController.dispose();
     super.dispose();
@@ -1950,6 +2705,14 @@ class _SettingsDialogState extends State<_SettingsDialog> {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
+            TextField(
+              controller: _invelosController,
+              decoration: const InputDecoration(
+                labelText: 'Invelos Username',
+                hintText: 'Enter your Invelos Profiler username',
+              ),
+            ),
+            const SizedBox(height: 16),
             TextField(
               controller: _tmdbController,
               decoration: const InputDecoration(
@@ -1976,6 +2739,7 @@ class _SettingsDialogState extends State<_SettingsDialog> {
         FilledButton(
           onPressed: () {
             final result = {
+              'invelos': _invelosController.text.trim(),
               'tmdb': _tmdbController.text.trim(),
               'omdb': _omdbController.text.trim(),
             };
