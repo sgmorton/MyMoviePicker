@@ -189,7 +189,7 @@ class InvelosScraper {
       // Front image URL on Invelos server
       final imageUrl = '';
 
-      // Detect media types using UPC code patterns, suffixes, and title keywords
+      // Detect media types from explicit title/row labels (not UPC guessing)
       final mediaTypes = detectMediaTypes(
         upc: upc,
         title: rawTitle,
@@ -205,7 +205,7 @@ class InvelosScraper {
             id: entryId,
             title: rawTitle,
             year: year,
-            mediaType: mediaTypes.first,
+            mediaType: mediaTypes.isNotEmpty ? mediaTypes.first : 'DVD',
             mediaTypes: mediaTypes,
             imageUrl: imageUrl,
             collectionNumber: collectionNum,
@@ -266,65 +266,78 @@ class InvelosScraper {
         .replaceAll('&nbsp;', ' ');
   }
 
-  /// Detects media types (4K, Blu-ray, 3D, DVD) using UPC patterns, suffixes, and title keywords.
+  /// Detects media types (4K, Blu-ray, 3D, DVD) from explicit labels in title/row HTML.
+  ///
+  /// Invelos List.aspx rows only expose Title + Coll# (no format column/icon). Detail
+  /// pages label format in the UPC line as e.g. (DVD), (Blu-ray), (4K UltraHD).
+  /// Do not infer format from retail UPC length or .N alternate-version suffixes -
+  /// those are not media-type codes. Unknown -> DVD (not Blu-ray).
+  ///
+  /// Returned list is ordered by primary priority: 4K > Blu-ray > 3D > DVD.
   static List<String> detectMediaTypes({
     required String upc,
     required String title,
     required String rowContent,
   }) {
-    final lowerTitle = title.toLowerCase();
-    // Strip DVD.aspx href URLs from rowContent to avoid false positive DVD matches from the URL path
-    final cleanRowContent = rowContent.replaceAll(RegExp(r'dvd\.aspx\?u=[^">]+', caseSensitive: false), '');
-    final lowerRow = cleanRowContent.toLowerCase();
+    // Strip DVD.aspx href URLs so path text cannot false-positive as DVD.
+    final cleanRowContent = rowContent.replaceAll(
+      RegExp(r'''dvd\.aspx\?u=[^\s"''>]+''', caseSensitive: false),
+      '',
+    );
+    final haystack = '${title.toLowerCase()} ${cleanRowContent.toLowerCase()}';
     final mediaTypes = <String>{};
 
-    // 1. Explicit Title / Row Keywords
-    if (lowerTitle.contains('4k') ||
-        lowerTitle.contains('ultra hd') ||
-        lowerTitle.contains('uhd') ||
-        lowerRow.contains('4k') ||
-        lowerRow.contains('ultra hd')) {
-      mediaTypes.add('4K');
-      mediaTypes.add('Blu-ray');
+    // Explicit parenthetical format labels (present on DVD.aspx detail; harmless on List rows)
+    // e.g. (DVD), (Blu-ray), (4K UltraHD), (Blu-ray & DVD Combo), (4K UltraHD & Blu-ray Combo)
+    final parenFormat = RegExp(
+      r'\(([^)]*(?:4k|ultra\s*hd|ultrahd|uhd|blu[-\s]?ray|hddvd|hd[-\s]?dvd|\bdvd\b)[^)]*)\)',
+      caseSensitive: false,
+    );
+    for (final match in parenFormat.allMatches(haystack)) {
+      _addFormatsFromText(mediaTypes, match.group(1) ?? '');
     }
-    if (lowerTitle.contains('blu-ray') ||
-        lowerTitle.contains('bluray') ||
-        lowerRow.contains('blu-ray') ||
-        lowerRow.contains('bluray')) {
-      mediaTypes.add('Blu-ray');
+
+    // Title / row keyword labels
+    _addFormatsFromText(mediaTypes, haystack);
+
+    // [upc] kept for API stability; not used for format inference.
+    if (upc.isEmpty) {
+      // no-op: List rows may omit UPC; format still comes from labels.
     }
-    if (lowerTitle.contains('3d') || lowerRow.contains('3d')) {
-      mediaTypes.add('3D');
-      mediaTypes.add('Blu-ray');
-    }
-    if (lowerTitle.contains('dvd') || lowerRow.contains(' dvd') || lowerRow.contains('dvd ')) {
+
+    if (mediaTypes.isEmpty) {
       mediaTypes.add('DVD');
     }
 
-    // 2. DVD Profiler UPC Suffix / Variant Codes
-    if (upc.endsWith('.4')) {
+    return prioritizeMediaTypes(mediaTypes);
+  }
+
+  /// Adds known format tokens found in [text] into [mediaTypes].
+  static void _addFormatsFromText(Set<String> mediaTypes, String text) {
+    final t = text.toLowerCase();
+    if (t.contains('4k') ||
+        t.contains('ultra hd') ||
+        t.contains('ultrahd') ||
+        RegExp(r'\buhd\b').hasMatch(t)) {
       mediaTypes.add('4K');
+    }
+    if (t.contains('blu-ray') ||
+        t.contains('bluray') ||
+        t.contains('blu ray')) {
       mediaTypes.add('Blu-ray');
-    } else if (upc.endsWith('.8') || upc.endsWith('.2') || upc.endsWith('.1')) {
-      mediaTypes.add('Blu-ray');
-    } else if (upc.endsWith('.3')) {
+    }
+    if (RegExp(r'\b3d\b').hasMatch(t)) {
       mediaTypes.add('3D');
-      mediaTypes.add('Blu-ray');
     }
-
-    // 3. Retail UPC Barcodes (All 12/13 digit UPCs for modern movies default to Blu-ray if not 4K)
-    final cleanUpc = upc.replaceAll(RegExp(r'[^0-9]'), '');
-    if (cleanUpc.length >= 12) {
-      if (!mediaTypes.contains('4K')) {
-        mediaTypes.add('Blu-ray');
-      }
+    if (RegExp(r'\bdvd\b').hasMatch(t)) {
+      mediaTypes.add('DVD');
     }
+  }
 
-    // 4. Default for unspecified items
-    if (mediaTypes.isEmpty) {
-      mediaTypes.add('Blu-ray');
-    }
-
-    return mediaTypes.toList();
+  /// Stable primary ordering: 4K > Blu-ray > 3D > DVD.
+  static List<String> prioritizeMediaTypes(Iterable<String> types) {
+    const order = ['4K', 'Blu-ray', '3D', 'DVD'];
+    final set = types.toSet();
+    return order.where(set.contains).toList();
   }
 }
