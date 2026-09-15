@@ -105,34 +105,57 @@ class InvelosScraper {
           appendLog('Step 2 did not contain DVD links. Fallback to Init body.');
           listHtml = initResp.body;
         }
+
+        onProgress?.call('Parsing movie list...', 0.6);
+        final parsedEntries = parseHtmlCollection(listHtml);
+        appendLog('Parsed ${parsedEntries.length} entries from list. Scraping detail format labels...');
+
+        if (parsedEntries.isNotEmpty) {
+          int processed = 0;
+          final total = parsedEntries.length;
+          const chunkSize = 15;
+
+          for (var i = 0; i < total; i += chunkSize) {
+            final chunk = parsedEntries.sublist(i, i + chunkSize > total ? total : i + chunkSize);
+            await Future.wait(chunk.map((movie) async {
+              if (movie.id.isEmpty) return;
+              try {
+                final detailUrl = 'https://www.invelos.com/onlinecollections/dvd/InBlue/DVD.aspx?U=${Uri.encodeComponent(movie.id)}';
+                final detailResp = await client.get(
+                  Uri.parse(detailUrl),
+                  headers: {
+                    ...headers,
+                    if (cookie != null && cookie.isNotEmpty) 'cookie': cookie,
+                  },
+                ).timeout(const Duration(seconds: 10));
+
+                if (detailResp.statusCode == 200) {
+                  final rawLabel = extractUpcFormatLabel(detailResp.body);
+                  if (rawLabel != null && rawLabel.isNotEmpty) {
+                    final detected = detectMediaTypesFromText(rawLabel);
+                    if (detected.isNotEmpty) {
+                      movie.mediaTypes = detected;
+                      movie.mediaType = detected.first;
+                    }
+                  }
+                }
+              } catch (_) {}
+            }));
+
+            processed += chunk.length;
+            onProgress?.call('Reading media formats from Invelos ($processed / $total)...', 0.6 + (0.35 * (processed / total)));
+          }
+        }
+
+        onProgress?.call('Done! Loaded ${parsedEntries.length} movies.', 1.0);
+        return parsedEntries;
       } finally {
         client.close();
       }
     }
 
-    onProgress?.call('Parsing movie titles...', 0.8);
-    appendLog('Parsing HTML (Length: ${listHtml.length} bytes)...');
-
+    onProgress?.call('Parsing movie list...', 0.6);
     final parsedEntries = parseHtmlCollection(listHtml);
-    appendLog('Successfully parsed ${parsedEntries.length} movie entries!');
-
-    if (parsedEntries.isEmpty) {
-      appendLog('ERROR: 0 movies parsed.');
-      if (kIsWeb) {
-        throw Exception(
-          'Invelos Online uses ASP.NET browser session cookies that modern web browsers block across domains in Chrome Web mode.\n\n'
-          'To sync your online collection automatically:\n'
-          '1. Run the app in Windows Desktop mode: flutter run -d windows\n'
-          '2. Or upload your DVD Profiler XML file using the Open XML button.',
-        );
-      } else {
-        throw Exception(
-          'Failed to scrape collection for "$cleanUsername".\n'
-          'Please verify your Invelos username spelling and ensure your collection is published online at https://www.invelos.com/DVDCollection.aspx/$cleanUsername',
-        );
-      }
-    }
-
     onProgress?.call('Done! Loaded ${parsedEntries.length} movies.', 1.0);
     return parsedEntries;
   }
@@ -305,10 +328,42 @@ class InvelosScraper {
       // no-op: List rows may omit UPC; format still comes from labels.
     }
 
-    if (mediaTypes.isEmpty) {
-      mediaTypes.add('DVD');
+    // If no explicit format label matched, return empty list so sync logic doesn't overwrite existing media types
+    return prioritizeMediaTypes(mediaTypes);
+  }
+
+  /// Extracts the parenthetical format label specifically from the UPC section of a detail page.
+  static String? extractUpcFormatLabel(String html) {
+    final unescaped = _unescapeHtml(html);
+    // Match UPC table cell content: UPC: ... <SPAN class="f2"> 043396-646926 (4K UltraHD & Blu-ray Combo) </SPAN>
+    final re1 = RegExp(
+      r'UPC:.*?</SPAN>\s*</TD>\s*<TD[^>]*>\s*<SPAN[^>]*>(.*?)</SPAN>',
+      caseSensitive: false,
+      dotAll: true,
+    );
+    final m1 = re1.firstMatch(unescaped);
+    if (m1 != null) {
+      final text = m1.group(1)!.trim();
+      final paren = RegExp(r'\(([^)]+)\)').firstMatch(text);
+      if (paren != null) {
+        return paren.group(1)!.trim();
+      }
+      return text;
     }
 
+    final re2 = RegExp(r'\b\d{5,14}[-\d.]*\s*\(([^)]+)\)', caseSensitive: false);
+    final m2 = re2.firstMatch(unescaped);
+    if (m2 != null) {
+      return m2.group(1)!.trim();
+    }
+
+    return null;
+  }
+
+  /// Extracts media types (4K, Blu-ray, 3D, DVD) from a detail page string.
+  static List<String> detectMediaTypesFromText(String text) {
+    final mediaTypes = <String>{};
+    _addFormatsFromText(mediaTypes, text);
     return prioritizeMediaTypes(mediaTypes);
   }
 

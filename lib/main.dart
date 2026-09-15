@@ -10,6 +10,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 import 'src/database/db_helper.dart';
 import 'package:simple_barcode_scanner/simple_barcode_scanner.dart';
+import 'package:url_launcher/url_launcher.dart';
 import 'secrets.dart';
 import 'src/services/invelos_scraper.dart';
 
@@ -60,6 +61,7 @@ class MovieEntry {
   String? collectionNumber; // Collection/BoxSet number for sorting
   String? overview;
   String? rottenTomatoesScore;
+  String? imdbId;
 
   MovieEntry({
     required this.id,
@@ -76,6 +78,7 @@ class MovieEntry {
     this.collectionNumber,
     this.overview,
     this.rottenTomatoesScore,
+    this.imdbId,
   });
 
   @override
@@ -129,6 +132,7 @@ class MovieEntry {
       'collectionNumber': collectionNumber,
       'overview': overview,
       'rottenTomatoesScore': rottenTomatoesScore,
+      'imdbId': imdbId,
     };
   }
 
@@ -152,6 +156,7 @@ class MovieEntry {
       collectionNumber: map['collectionNumber'] as String?,
       overview: map['overview'],
       rottenTomatoesScore: map['rottenTomatoesScore'],
+      imdbId: map['imdbId'] as String?,
     );
   }
 }
@@ -202,10 +207,9 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
     final storedVersion = storedVersionStr != null ? int.parse(storedVersionStr) : 0;
     if (storedVersion < _kDataVersion) {
       print(
-        'Old data version ($storedVersion) found. Clearing cache to force re-parse from version $_kDataVersion.',
+        'Old data version ($storedVersion) found. Clearing movies to force re-parse from version $_kDataVersion.',
       );
       await _dbHelper.clearMovies();
-      await _dbHelper.clearCachedImages();
       await _dbHelper.saveSetting('data_version', _kDataVersion.toString());
     }
 
@@ -242,10 +246,7 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
           if (!mounted) break;
 
           // Short-circuit as soon as we find an image.
-          bool found =
-              await _fetchCoverFromTmdbForMovie(movie) ||
-              await _fetchCoverFromItunesForMovie(movie) ||
-              await _fetchCoverFromOmdbForMovie(movie);
+          bool found = await _enrichMovieMetadata(movie);
 
           if (found) {
             anyChanged = true;
@@ -570,13 +571,91 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
     return null;
   }
 
-  Future<bool> _fetchCoverFromOmdbForMovie(MovieEntry m) async {
+  Future<bool> _fetchTmdbMetadataForMovie(MovieEntry m) async {
+    if (_tmdbApiKey == null || _tmdbApiKey!.isEmpty) return false;
+    final candidates = _getTitleCandidates(m.title);
+    final String? year = m.year;
+
+    for (final candidate in candidates) {
+      final cleanTitle = _unescapeHtml(candidate);
+      final encodedTitle = Uri.encodeQueryComponent(cleanTitle);
+      final yearParam = (year != null && year.isNotEmpty) ? '&year=${Uri.encodeQueryComponent(year)}' : '';
+      final url = 'https://api.themoviedb.org/3/search/movie?query=$encodedTitle$yearParam&api_key=$_tmdbApiKey';
+
+      try {
+        final resp = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 10));
+        if (resp.statusCode == 200) {
+          final data = json.decode(resp.body);
+          if (data is Map && data['results'] is List) {
+            final results = data['results'] as List;
+            if (results.isNotEmpty && results.first is Map) {
+              final firstResult = results.first as Map;
+              bool changed = false;
+
+              final posterPath = firstResult['poster_path'] as String?;
+              if ((m.imageUrl.isEmpty || m.imageUrl.contains('invelos.com')) &&
+                  posterPath != null &&
+                  posterPath.isNotEmpty &&
+                  posterPath != 'null') {
+                m.imageUrl = 'https://image.tmdb.org/t/p/w342$posterPath';
+                changed = true;
+              }
+
+              final overview = firstResult['overview'] as String?;
+              if ((m.overview == null || m.overview!.isEmpty || m.overview == 'No summary available.') &&
+                  overview != null &&
+                  overview.trim().isNotEmpty) {
+                m.overview = overview.trim();
+                changed = true;
+              }
+
+              final int? tmdbId = firstResult['id'] as int?;
+              if (tmdbId != null &&
+                  ((m.imdbId == null || m.imdbId!.isEmpty) ||
+                   (m.rottenTomatoesScore == null || m.rottenTomatoesScore!.isEmpty))) {
+                final detailUrl = 'https://api.themoviedb.org/3/movie/$tmdbId?api_key=$_tmdbApiKey';
+                final detailResp = await http.get(Uri.parse(detailUrl)).timeout(const Duration(seconds: 10));
+                if (detailResp.statusCode == 200) {
+                  final detailData = json.decode(detailResp.body);
+                  if (detailData is Map) {
+                    final imdbId = detailData['imdb_id'] as String?;
+                    if ((m.imdbId == null || m.imdbId!.isEmpty) && imdbId != null && imdbId.isNotEmpty) {
+                      m.imdbId = imdbId;
+                      changed = true;
+                    }
+                    final voteAverage = detailData['vote_average'];
+                    if ((m.rottenTomatoesScore == null || m.rottenTomatoesScore!.isEmpty) && voteAverage != null && voteAverage > 0) {
+                      final scorePercent = (voteAverage * 10).round();
+                      m.rottenTomatoesScore = '$scorePercent%';
+                      changed = true;
+                    }
+                  }
+                }
+              }
+
+              if (changed) return true;
+            }
+          }
+        }
+      } catch (e) {
+        print('TMDb metadata fetch error for "$cleanTitle": $e');
+      }
+    }
+    return false;
+  }
+
+  Future<bool> _fetchCoverFromOmdbForMovie(MovieEntry m, {String? apiKey}) async {
+    final keyToUse = (apiKey != null && apiKey.isNotEmpty)
+        ? apiKey
+        : ((_omdbApiKey != null && _omdbApiKey!.isNotEmpty) ? _omdbApiKey! : 'b9723a31');
+    if (keyToUse.isEmpty) return false;
+
     final candidates = _getTitleCandidates(m.title);
     for (final candidate in candidates) {
       final cleanTitle = _unescapeHtml(candidate);
       final title = Uri.encodeQueryComponent(cleanTitle);
       final year = m.year != null ? '&y=${Uri.encodeQueryComponent(m.year!)}' : '';
-      final url = 'https://www.omdbapi.com/?apikey=$_omdbApiKey&t=$title$year';
+      final url = 'https://www.omdbapi.com/?apikey=$keyToUse&t=$title$year';
 
       try {
         final resp = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 10));
@@ -591,8 +670,16 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
               m.imageUrl = data['Poster'];
               changed = true;
             }
-            if ((m.overview == null || m.overview!.isEmpty) && data['Plot'] != null) {
+            if ((m.overview == null || m.overview!.isEmpty || m.overview == 'No summary available.') &&
+                data['Plot'] != null &&
+                data['Plot'] != 'N/A') {
               m.overview = data['Plot'];
+              changed = true;
+            }
+            if ((m.imdbId == null || m.imdbId!.isEmpty) &&
+                data['imdbID'] != null &&
+                data['imdbID'] != 'N/A') {
+              m.imdbId = data['imdbID'];
               changed = true;
             }
             if ((m.rottenTomatoesScore == null || m.rottenTomatoesScore!.isEmpty) &&
@@ -823,11 +910,22 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
         uniqueItems.add(item);
       } else {
         final existing = _all[existingIndex];
+        existing.title = item.title;
+        if (item.year != null && item.year!.isNotEmpty) existing.year = item.year;
+        if (item.genres != null && item.genres!.isNotEmpty) existing.genres = item.genres;
+        if (item.mediaType != null) existing.mediaType = item.mediaType;
+        if (item.mediaTypes.isNotEmpty) existing.mediaTypes = item.mediaTypes;
+        if (item.runtime != null && item.runtime!.isNotEmpty) existing.runtime = item.runtime;
+        if (item.mpaa != null && item.mpaa!.isNotEmpty) existing.mpaa = item.mpaa;
+        existing.isCollectionParent = item.isCollectionParent;
         if (item.collectionNumber != null && item.collectionNumber!.isNotEmpty) {
           existing.collectionNumber = item.collectionNumber;
         }
         if (item.overview != null && item.overview!.isNotEmpty) {
           existing.overview = item.overview;
+        }
+        if (item.frontImageFilename != null && item.frontImageFilename!.isNotEmpty) {
+          existing.frontImageFilename = item.frontImageFilename;
         }
       }
     }
@@ -849,6 +947,24 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
 
   void _saveXml(String content) async {
     await _dbHelper.saveSetting('last_xml', content);
+  }
+
+  Future<void> _reparseLastXml() async {
+    final savedXml = await _dbHelper.getSetting('last_xml');
+    if (savedXml == null || savedXml.isEmpty) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('No saved XML file found. Please upload your XML file.')),
+        );
+      }
+      return;
+    }
+    _loadFromXml(savedXml);
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Refreshed collection data for ${_all.length} movies from XML! Images preserved.')),
+      );
+    }
   }
 
   Future<void> _persistEntries() async {
@@ -941,10 +1057,7 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
       for (final movie in toFetch) {
         if (!mounted) break;
         current++;
-        bool found =
-            await _fetchCoverFromTmdbForMovie(movie) ||
-            await _fetchCoverFromItunesForMovie(movie) ||
-            await _fetchCoverFromOmdbForMovie(movie);
+        bool found = await _enrichMovieMetadata(movie);
         if (found) {
           successCount++;
         }
@@ -1225,7 +1338,7 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
               children: const [
                 Icon(Icons.cloud_download),
                 SizedBox(width: 12),
-                Text('Importing Collection'),
+                Expanded(child: Text('Importing Collection')),
               ],
             ),
             content: Column(
@@ -1270,7 +1383,10 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
 
         if (existingIndex != -1) {
           final existing = _all[existingIndex];
-          existing.collectionNumber = item.collectionNumber;
+          if (item.collectionNumber != null && item.collectionNumber!.isNotEmpty) {
+            existing.collectionNumber = item.collectionNumber;
+          }
+          // Only update mediaTypes if an EXPLICIT format keyword was detected in title
           if (item.mediaTypes.isNotEmpty) {
             existing.mediaTypes = item.mediaTypes;
             existing.mediaType = item.mediaType;
@@ -1280,6 +1396,11 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
           }
           updatedCount++;
         } else {
+          // For new items without explicit format label in title, default to Blu-ray
+          if (item.mediaTypes.isEmpty) {
+            item.mediaTypes = ['Blu-ray'];
+            item.mediaType = 'Blu-ray';
+          }
           _all.add(item);
           addedCount++;
         }
@@ -1344,6 +1465,33 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
     }
   }
 
+  Future<void> _convertDvdsToBluray() async {
+    int count = 0;
+    for (final m in _all) {
+      if (m.mediaTypes.isEmpty || (m.mediaTypes.length == 1 && m.mediaTypes.first == 'DVD')) {
+        m.mediaTypes = ['Blu-ray'];
+        m.mediaType = 'Blu-ray';
+        count++;
+      }
+    }
+    if (count > 0) {
+      setState(() {});
+      await _persistEntries();
+      _applyFilters();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Updated $count movies from DVD to Blu-ray!')),
+        );
+      }
+    } else {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('No movies needed updating.')),
+        );
+      }
+    }
+  }
+
   void _openSettings() async {
     final result = await showDialog<Map<String, String>>(
       context: context,
@@ -1352,6 +1500,7 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
           initialInvelosUsername: _invelosUsername,
           initialTmdbApiKey: _tmdbApiKey,
           initialOmdbApiKey: _omdbApiKey,
+          onConvertDvdsToBluray: _convertDvdsToBluray,
         );
       },
     );
@@ -1533,7 +1682,7 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
     }
   }
 
-  Future<void> _enrichMovieMetadata(MovieEntry movie) async {
+  Future<bool> _enrichMovieMetadata(MovieEntry movie) async {
     String cleanTitle = movie.title;
     cleanTitle = cleanTitle
         .replaceAll(RegExp(r"\b(Blu-ray|DVD|4K|Ultra HD|Special Edition|Collector's Edition|Combo Pack|Widescreen)\b", caseSensitive: false), '')
@@ -1541,16 +1690,21 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
         .trim();
 
     final originalTitle = movie.title;
-    movie.title = cleanTitle;
+    if (cleanTitle.isNotEmpty) {
+      movie.title = cleanTitle;
+    }
 
-    // Fetch details
-    await _fetchCoverFromTmdbForMovie(movie);
-    await _fetchCoverFromItunesForMovie(movie);
-    await _fetchCoverFromOmdbForMovie(movie);
+    bool changed = false;
+    if (await _fetchTmdbMetadataForMovie(movie)) changed = true;
+    if (await _fetchCoverFromOmdbForMovie(movie)) changed = true;
+    if (movie.imageUrl.isEmpty || movie.imageUrl.contains('invelos.com')) {
+      if (await _fetchCoverFromItunesForMovie(movie)) changed = true;
+    }
 
     if (movie.imageUrl.isEmpty) {
       movie.title = originalTitle;
     }
+    return changed;
   }
 
   void _showEditMovieDialog(MovieEntry movie, {required bool isNew}) {
@@ -1859,15 +2013,16 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
     }
 
     // Nested <MediaTypes><BluRay>true</BluRay>...</MediaTypes>
-    final mediaTypesNodes = dvd.findElements('MediaTypes');
+    final mediaTypesNodes = dvd.findAllElements('MediaTypes');
     if (mediaTypesNodes.isNotEmpty) {
-      final mt = mediaTypesNodes.first;
-      for (final child in mt.children.whereType<XmlElement>()) {
-        final key = child.name.local;
-        final displayName = booleanFields[key] ?? key;
-        final val = child.innerText.trim().toLowerCase();
-        if (val == 'true' || val == '1' || val == 'yes') {
-          types.add(displayName);
+      for (final mt in mediaTypesNodes) {
+        for (final child in mt.children.whereType<XmlElement>()) {
+          final key = child.name.local;
+          final displayName = booleanFields[key] ?? key;
+          final val = child.innerText.trim().toLowerCase();
+          if (val == 'true' || val == '1' || val == 'yes') {
+            types.add(displayName);
+          }
         }
       }
     }
@@ -1876,8 +2031,8 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
       final fieldName = entry.key;
       final displayName = entry.value;
 
-      // Check if this field exists and is true
-      final fieldValue = _firstText(dvd, [fieldName]);
+      // Check if this field exists and is true (search recursively through children/Format)
+      final fieldValue = _firstText(dvd, [fieldName], recursive: true);
       if (fieldValue != null &&
           (fieldValue.toLowerCase() == 'true' || fieldValue == '1')) {
         types.add(displayName);
@@ -1886,7 +2041,7 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
 
     // Fallback to the old method if no boolean fields found
     if (types.isEmpty) {
-      final raw = _firstText(dvd, const ['MediaType', 'MediaTypes']);
+      final raw = _firstText(dvd, const ['MediaType', 'MediaTypes'], recursive: true);
       return _normalizeMediaTypes(raw);
     }
 
@@ -2034,8 +2189,115 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
     );
   }
 
+  void _openWatchNextSheet() {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Theme.of(context).colorScheme.surface,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (context) {
+        return StatefulBuilder(
+          builder: (context, setSheetState) {
+            return SizedBox(
+              height: MediaQuery.of(context).size.height * 0.8,
+              child: Padding(
+                padding: const EdgeInsets.all(16.0),
+                child: Column(
+                  children: [
+                    Container(
+                      width: 40,
+                      height: 4,
+                      decoration: BoxDecoration(
+                        color: Colors.white30,
+                        borderRadius: BorderRadius.circular(2),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    Text(
+                      'What are we watching?',
+                      style: Theme.of(context).textTheme.titleLarge,
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      '(${_watchNext.length} of 16 selected)',
+                      style: Theme.of(context).textTheme.bodySmall,
+                    ),
+                    const SizedBox(height: 16),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        FilledButton.icon(
+                          onPressed: _watchNext.isNotEmpty
+                              ? () {
+                                  Navigator.pop(context);
+                                  _pickFromWatchNext();
+                                }
+                              : null,
+                          icon: const Icon(Icons.casino),
+                          label: const Text('Surprise Pick'),
+                        ),
+                        const SizedBox(width: 12),
+                        OutlinedButton.icon(
+                          onPressed: _watchNext.isNotEmpty
+                              ? () {
+                                  setState(() {
+                                    _watchNext.clear();
+                                  });
+                                  setSheetState(() {});
+                                }
+                              : null,
+                          icon: const Icon(Icons.delete_outline),
+                          label: const Text('Clear Queue'),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 16),
+                    Expanded(
+                      child: _watchNext.isEmpty
+                          ? const Center(
+                              child: Text(
+                                'Your Watch Next queue is empty.\nTap movies in your collection to add them here!',
+                                textAlign: TextAlign.center,
+                              ),
+                            )
+                          : GridView.builder(
+                              gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                                crossAxisCount: 2,
+                                childAspectRatio: 0.75,
+                                mainAxisSpacing: 8,
+                                crossAxisSpacing: 8,
+                              ),
+                              itemCount: _watchNext.length,
+                              itemBuilder: (context, index) {
+                                final movie = _watchNext[index];
+                                return _WatchNextCard(
+                                  entry: movie,
+                                  onRemove: () {
+                                    setState(() {
+                                      _watchNext.removeAt(index);
+                                    });
+                                    setSheetState(() {});
+                                  },
+                                );
+                              },
+                            ),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
+    final bool isMobileScreen = MediaQuery.of(context).size.width < 700 || MediaQuery.of(context).size.shortestSide < 600;
+
     return Scaffold(
       appBar: AppBar(
         title: FittedBox(
@@ -2060,6 +2322,15 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
         ),
         actions: [
           IconButton(
+            tooltip: 'Watch Next Queue (${_watchNext.length})',
+            onPressed: _openWatchNextSheet,
+            icon: Badge(
+              isLabelVisible: _watchNext.isNotEmpty,
+              label: Text('${_watchNext.length}'),
+              child: const Icon(Icons.movie_creation_outlined),
+            ),
+          ),
+          IconButton(
             tooltip: 'Sync Invelos Online',
             onPressed: _syncInvelosCollection,
             icon: const Icon(Icons.cloud_download),
@@ -2080,12 +2351,27 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
             icon: const Icon(Icons.add),
           ),
           IconButton(
+            tooltip: 'Re-parse XML (Refresh Data)',
+            onPressed: _reparseLastXml,
+            icon: const Icon(Icons.sync),
+          ),
+          IconButton(
             tooltip: 'Open XML',
             onPressed: _pickFile,
             icon: const Icon(Icons.upload_file),
           ),
         ],
       ),
+      floatingActionButton: (isMobileScreen && _watchNext.isNotEmpty)
+          ? FloatingActionButton.extended(
+              onPressed: _openWatchNextSheet,
+              icon: Badge(
+                label: Text('${_watchNext.length}'),
+                child: const Icon(Icons.movie_creation_outlined),
+              ),
+              label: const Text('Watch Next'),
+            )
+          : null,
       body: _all.isEmpty
           ? Center(
               child: DottedBorderContainer(
@@ -2110,7 +2396,7 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
             )
           : LayoutBuilder(
               builder: (context, constraints) {
-                final isMobile = constraints.maxWidth < 700;
+                final isMobile = constraints.maxWidth < 700 || MediaQuery.of(context).size.shortestSide < 600;
                 if (isMobile) {
                   return Column(
                     children: [
@@ -2118,7 +2404,7 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
                         padding: const EdgeInsets.fromLTRB(6, 4, 6, 4),
                         child: _buildFilterBar(),
                       ),
-                      Expanded(child: _buildBody()),
+                      Expanded(child: _buildBody(isMobile: true)),
                     ],
                   );
                 }
@@ -2132,7 +2418,7 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
                             padding: const EdgeInsets.fromLTRB(8, 6, 8, 4),
                             child: _buildFilterBar(),
                           ),
-                          Expanded(child: _buildBody()),
+                          Expanded(child: _buildBody(isMobile: false)),
                         ],
                       ),
                     ),
@@ -2156,7 +2442,39 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
     );
   }
 
-  Widget _buildBody() {
+  void _showMovieDetails(MovieEntry movie) async {
+    if (movie.overview == null ||
+        movie.overview!.isEmpty ||
+        movie.overview == 'No summary available.' ||
+        movie.rottenTomatoesScore == null ||
+        movie.rottenTomatoesScore!.isEmpty ||
+        movie.imdbId == null ||
+        movie.imdbId!.isEmpty) {
+      await _enrichMovieMetadata(movie);
+      await _persistEntries();
+    }
+
+    if (!mounted) return;
+    showDialog(
+      context: context,
+      builder: (context) => _SurpriseDialog(
+        entry: movie,
+        dialogTitle: 'Movie Details',
+        onAddToWatchNext: () {
+          setState(() {
+            if (_watchNext.length < 16 && !_watchNext.contains(movie)) {
+              _watchNext.add(movie);
+            }
+          });
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Added "${movie.title}" to Watch Next!')),
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _buildBody({required bool isMobile}) {
     final grid = GridView.builder(
       padding: const EdgeInsets.all(6),
       gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
@@ -2170,11 +2488,15 @@ class _MoviePickerPageState extends State<MoviePickerPage> {
         final m = _filtered[index];
         return InkWell(
           onTap: () {
-            setState(() {
-              if (_watchNext.length < 16 && !_watchNext.contains(m)) {
-                _watchNext.add(m);
-              }
-            });
+            if (isMobile) {
+              _showMovieDetails(m);
+            } else {
+              setState(() {
+                if (_watchNext.length < 16 && !_watchNext.contains(m)) {
+                  _watchNext.add(m);
+                }
+              });
+            }
           },
           child: _MovieCard(entry: m),
         );
@@ -2658,11 +2980,13 @@ class _SettingsDialog extends StatefulWidget {
   final String? initialInvelosUsername;
   final String? initialTmdbApiKey;
   final String? initialOmdbApiKey;
+  final VoidCallback? onConvertDvdsToBluray;
 
   const _SettingsDialog({
     this.initialInvelosUsername,
     this.initialTmdbApiKey,
     this.initialOmdbApiKey,
+    this.onConvertDvdsToBluray,
   });
 
   @override
@@ -2727,6 +3051,16 @@ class _SettingsDialogState extends State<_SettingsDialog> {
                 labelText: 'OMDb API Key',
                 hintText: 'Enter your Open Movie Database API key',
               ),
+            ),
+            const SizedBox(height: 20),
+            const Divider(),
+            const SizedBox(height: 8),
+            OutlinedButton.icon(
+              onPressed: () {
+                widget.onConvertDvdsToBluray?.call();
+              },
+              icon: const Icon(Icons.movie),
+              label: const Text('Convert all "DVD" entries to "Blu-ray"'),
             ),
           ],
         ),
@@ -2818,101 +3152,197 @@ class _WatchNextCard extends StatelessWidget {
   }
 }
 
+Future<void> _launchExternalUrl(String urlString) async {
+  final uri = Uri.parse(urlString);
+  try {
+    bool launched = await launchUrl(uri, mode: LaunchMode.externalApplication);
+    if (!launched) {
+      await launchUrl(uri, mode: LaunchMode.platformDefault);
+    }
+  } catch (e) {
+    print('Error launching URL $urlString: $e');
+    try {
+      await launchUrl(uri, mode: LaunchMode.platformDefault);
+    } catch (_) {}
+  }
+}
+
 class _SurpriseDialog extends StatelessWidget {
   final MovieEntry entry;
-  const _SurpriseDialog({required this.entry});
+  final String? dialogTitle;
+  final VoidCallback? onAddToWatchNext;
+
+  const _SurpriseDialog({
+    required this.entry,
+    this.dialogTitle,
+    this.onAddToWatchNext,
+  });
 
   @override
   Widget build(BuildContext context) {
     return Dialog(
+      clipBehavior: Clip.antiAlias,
       child: ConstrainedBox(
         constraints: BoxConstraints(
-          maxWidth: 900,
-          maxHeight: MediaQuery.of(context).size.height * 0.9,
+          maxWidth: 600,
+          maxHeight: MediaQuery.of(context).size.height * 0.85,
         ),
         child: Padding(
-          padding: const EdgeInsets.all(24.0),
+          padding: const EdgeInsets.all(20.0),
           child: Column(
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              Text(
-                'Enjoy the movie!',
-                style: Theme.of(context).textTheme.headlineMedium,
-                textAlign: TextAlign.center,
-              ),
-              const SizedBox(height: 8),
-              Text(
-                entry.title,
-                style: Theme.of(context).textTheme.headlineSmall,
-                textAlign: TextAlign.center,
-              ),
-              const SizedBox(height: 24),
               Flexible(
                 child: SingleChildScrollView(
-                  child: Row(
+                  child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Expanded(
-                        flex: 2,
-                        child: AspectRatio(
-                          aspectRatio: 2 / 3,
-                          child: _Poster(
-                            imageUrl: entry.imageUrl,
-                            title: entry.title,
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 24),
-                      Expanded(
-                        flex: 3,
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              entry.overview ?? 'No summary available.',
-                              style: Theme.of(context).textTheme.bodyLarge,
+                      // Top Row: Poster thumbnail on the left, Title + metadata chips on the right
+                      Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          SizedBox(
+                            width: 110,
+                            height: 160,
+                            child: ClipRRect(
+                              borderRadius: BorderRadius.circular(8),
+                              child: _Poster(
+                                imageUrl: entry.imageUrl,
+                                title: entry.title,
+                              ),
                             ),
-                            const SizedBox(height: 16),
-                            Wrap(
-                              spacing: 8,
-                              runSpacing: 4,
+                          ),
+                          const SizedBox(width: 16),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
                               children: [
-                                if ((entry.year ?? '').isNotEmpty)
-                                  _Chip(label: entry.year!),
-                                if ((entry.rottenTomatoesScore ?? '')
-                                    .isNotEmpty)
-                                  _Chip(
-                                    label: '🍅 ${entry.rottenTomatoesScore!}',
+                                Text(
+                                  entry.title,
+                                  style: Theme.of(context).textTheme.headlineSmall?.copyWith(
+                                    fontWeight: FontWeight.bold,
                                   ),
-                                if ((entry.runtime ?? '').isNotEmpty)
-                                  _Chip(label: '${entry.runtime} min'),
-                                if ((entry.mpaa ?? '').isNotEmpty)
-                                  _Chip(label: entry.mpaa!),
-                                ...entry.mediaTypes
-                                    .where(
-                                      (t) =>
-                                          t.trim().isNotEmpty &&
-                                          t.toLowerCase() != 'true' &&
-                                          t.toLowerCase() != 'false',
-                                    )
-                                    .map((t) => _MediaTypeChip(label: t)),
+                                ),
+                                const SizedBox(height: 10),
+                                Wrap(
+                                  spacing: 6,
+                                  runSpacing: 4,
+                                  children: [
+                                    if ((entry.year ?? '').isNotEmpty)
+                                      _Chip(label: entry.year!),
+                                    if ((entry.rottenTomatoesScore ?? '').isNotEmpty)
+                                      _Chip(label: '🍅 ${entry.rottenTomatoesScore!}'),
+                                    if ((entry.runtime ?? '').isNotEmpty)
+                                      _Chip(label: '${entry.runtime} min'),
+                                    if ((entry.mpaa ?? '').isNotEmpty)
+                                      _Chip(label: entry.mpaa!),
+                                    ...entry.mediaTypes
+                                        .where((t) =>
+                                            t.trim().isNotEmpty &&
+                                            t.toLowerCase() != 'true' &&
+                                            t.toLowerCase() != 'false')
+                                        .map((t) => _MediaTypeChip(label: t)),
+                                  ],
+                                ),
                               ],
                             ),
-                          ],
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 16),
+                      const Divider(height: 1),
+                      const SizedBox(height: 14),
+
+                      // Overview / Summary below top row
+                      Text(
+                        'Overview',
+                        style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                          fontWeight: FontWeight.bold,
+                          color: Colors.grey[400],
                         ),
+                      ),
+                      const SizedBox(height: 6),
+                      Text(
+                        entry.overview ?? 'No summary available.',
+                        style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                          height: 1.4,
+                        ),
+                      ),
+                      const SizedBox(height: 18),
+
+                      // More Info links below summary
+                      const Text(
+                        'More Info:',
+                        style: TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.grey,
+                        ),
+                      ),
+                      const SizedBox(height: 6),
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 6,
+                        children: [
+                          ActionChip(
+                            avatar: const Text('🍅', style: TextStyle(fontSize: 14)),
+                            label: const Text('Rotten Tomatoes'),
+                            onPressed: () {
+                              final q = Uri.encodeQueryComponent(entry.title);
+                              _launchExternalUrl('https://www.rottentomatoes.com/search?search=$q');
+                            },
+                          ),
+                          ActionChip(
+                            avatar: const Icon(Icons.movie_creation_outlined, size: 16, color: Colors.amber),
+                            label: const Text('IMDb'),
+                            onPressed: () {
+                              if (entry.imdbId != null && entry.imdbId!.isNotEmpty) {
+                                _launchExternalUrl('https://www.imdb.com/title/${entry.imdbId}/');
+                              } else {
+                                final q = Uri.encodeQueryComponent(entry.title);
+                                _launchExternalUrl('https://www.imdb.com/find/?q=$q');
+                              }
+                            },
+                          ),
+                          ActionChip(
+                            avatar: const Icon(Icons.local_movies_outlined, size: 16, color: Colors.lightBlueAccent),
+                            label: const Text('TMDb'),
+                            onPressed: () {
+                              final q = Uri.encodeQueryComponent(entry.title);
+                              _launchExternalUrl('https://www.themoviedb.org/search?query=$q');
+                            },
+                          ),
+                        ],
                       ),
                     ],
                   ),
                 ),
               ),
-              const SizedBox(height: 24),
-              Align(
-                alignment: Alignment.centerRight,
-                child: TextButton(
-                  child: const Text('OK'),
-                  onPressed: () => Navigator.of(context).pop(),
-                ),
+              const SizedBox(height: 16),
+              const Divider(height: 1),
+              const SizedBox(height: 12),
+
+              // Bottom buttons
+              Wrap(
+                alignment: WrapAlignment.end,
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  if (onAddToWatchNext != null)
+                    OutlinedButton.icon(
+                      onPressed: () {
+                        onAddToWatchNext!();
+                        Navigator.of(context).pop();
+                      },
+                      icon: const Icon(Icons.playlist_add),
+                      label: const Text('Add to Watch Next'),
+                    ),
+                  FilledButton(
+                    child: const Text('Close'),
+                    onPressed: () => Navigator.of(context).pop(),
+                  ),
+                ],
               ),
             ],
           ),

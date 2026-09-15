@@ -16,6 +16,11 @@ class DbHelper {
   Future<Database> get database async {
     if (_db != null) return _db!;
     _db = await _initDatabase();
+    try {
+      await _db!.execute('ALTER TABLE movies ADD COLUMN imdbId TEXT');
+    } catch (_) {
+      // Column already exists or table freshly created
+    }
     return _db!;
   }
 
@@ -36,7 +41,7 @@ class DbHelper {
 
     return await openDatabase(
       path,
-      version: 1,
+      version: 2,
       onCreate: (db, version) async {
         print('Creating tables in SQLite database...');
         await db.execute('''
@@ -61,7 +66,8 @@ class DbHelper {
             isCollectionParent INTEGER,
             collectionNumber TEXT,
             overview TEXT,
-            rottenTomatoesScore TEXT
+            rottenTomatoesScore TEXT,
+            imdbId TEXT
           )
         ''');
 
@@ -72,6 +78,17 @@ class DbHelper {
           )
         ''');
         print('Tables created successfully.');
+      },
+      onUpgrade: (db, oldVersion, newVersion) async {
+        print('Upgrading database from $oldVersion to $newVersion');
+        if (oldVersion < 2) {
+          try {
+            await db.execute('ALTER TABLE movies ADD COLUMN imdbId TEXT');
+            print('Successfully added imdbId column to movies table.');
+          } catch (e) {
+            print('Failed/Skipped adding imdbId column: $e');
+          }
+        }
       },
     );
   }
@@ -272,6 +289,7 @@ class DbHelper {
       'collectionNumber': m.collectionNumber,
       'overview': m.overview,
       'rottenTomatoesScore': m.rottenTomatoesScore,
+      'imdbId': m.imdbId,
     };
   }
 
@@ -299,6 +317,7 @@ class DbHelper {
       collectionNumber: map['collectionNumber'] as String?,
       overview: map['overview'] as String?,
       rottenTomatoesScore: map['rottenTomatoesScore'] as String?,
+      imdbId: map['imdbId'] as String?,
     );
   }
 }
